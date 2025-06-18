@@ -31,7 +31,7 @@
     - route to a the connection to an another service on the message broker to perform some transaction within the transaction service
     - close the connection as the lifecycle of the entity is complete
 - the client will need to listen for the messages and determine whether it is a ping message, if so return a pong message
-- when the message is a pub from the broker, the message wil be consumed and use in within the application logic
+- when the message is a pub from the broker, the message will be consumed and use in within the application logic
 ## Publish
 - the message broker will recieve the subsscription parameters for each micro subscription
 - the message broker will determine the number of total messages that will be sent within the window
@@ -42,4 +42,45 @@
 - when the subscription window finishes, the message broker will then wait for the next action based on the client response
 - if the client requests another micro subscription, then the message broker will repeat this process
 - otherwise the message broker will either adjust the subscription parameters, or propogate the connection to the next relevant step
+
+## Message Structure
+- there are three broad categories that need to be consider
+    1. Subscribing, and subscription renewal
+    2. Routing the connection
+    3. Closing the connection gracefully
+
+    Initial subscription -> renew subscription -> route connection -> close connection
+### 1: Subscribing and subscription renewal
+- every server client interaction will start with an initial subscription message
+- after that pub-sub window has reached it duration, the client will renew the subscription by passing the new subscription parameters
+- the server then adjust the message publishing pattern based on the parameters passd by the client
+- any server side action, such as going in with additional volume can also be passed in the subscription renewal, if so, the server will perform the proper action
+- on a connection failure, this can be handle by the client simply reconnecting on a fresh subscription
+    - there needs to be client and server side logic to make sure the data stays consistent in this case
+    - edge cases to consider: brainstorming as I write this
+        - client requests additional volume, connection is dropped. It is ambiguous as to if the order was executed or not
+            - the same case applies for selling volume
+        - conncection drops during a publishing window
+            - server and client must realign at this point
+            - a reconnect is needed
+            - the server must have logic to recognize that this is an active symbol
+            - client must re subscribe with no additional volume, and likely adjust the subscription window, perhaps the time the was left in the subscription window that was dropped
+- subscriptions are renewed until the client determines that some other action is required, thus the logic is moved to another endpoint on the server
+### 2: Routing the connection
+- Given we have a closed system here, there is no logic required to publish the endpoints, though in an open server, this would be a valuable thing to have
+- Then client will determine that it is time to move the entity into some new state
+- at the end of a publishing window, the client will send a message to the server, dictating to move the connection to some other logical endpoint
+- the client and server will then start exchanging messages regarding that logical state
+- things to consider:
+    - client side state machine needs to accurately enforce state boundaries
+        - like if we are moving to start selling volume, ww should not have the ability to send a subscription related message
+    - given this is a closed system, the logic on both the server and the client should be aligned in terms of possible actions that are taken in each state
+- there should also be the ability to route back
+### 3: CLosing the connection
+- In the non failure case, the client should prompt the server to close the connection, to clean up any in memory resources
+- client will send a message to server indicating that the session is over
+- server will then close the connection
+- client will wait to recieve a connection close response from the server
+- then the client can clean up all resources associated with the entity
+
 
