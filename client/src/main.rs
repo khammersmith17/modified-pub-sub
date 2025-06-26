@@ -6,29 +6,31 @@ use tungstenite::Message;
 mod types;
 use bincode::config;
 use std::time::Instant;
-use types::{PubMessage, Subscribe};
+use types::{PubMessage, ServerSubscription};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // first connecting to base
-    println!("Connecting to base");
     let (stream, _) = connect_async("ws://localhost:8080/base").await?;
 
     let (mut writr, mut recvr) = stream.split();
 
-    let subscription_message = Subscribe {
-        publish_cadence: 10,
-        window: 60,
-    };
-    let subscription_str = serde_json::to_string(&subscription_message)?;
-
     let bincode_config = config::standard();
+    let mut server_sub = ServerSubscription::new(String::from("symbol"));
 
     writr
-        .send(Message::Binary(Bytes::from(subscription_str)))
+        .send(Message::Binary(Bytes::from(server_sub.handshake()?)))
         .await?;
-    let mut recieved_messages = 0_usize;
-    while recieved_messages < 5 {
+    println!("sent handshake");
+    writr
+        .send(Message::Binary(Bytes::from(
+            server_sub.update_parameters(1_u16, 5_u16)?,
+        )))
+        .await?;
+    println!("updated parameters");
+
+    let mut num_messages = 0_usize;
+    while num_messages < 5 {
         let now = Instant::now();
         let Some(data) = recvr.next().await else {
             continue;
@@ -38,10 +40,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                 Message::Binary(b) => {
                     let (decoded_data, _n) =
                         bincode::serde::decode_from_slice::<PubMessage, _>(&b, bincode_config)?;
-                    recieved_messages += 1;
+                    num_messages += 1;
                     decoded_data
                 }
-                Message::Text(b) => serde_json::from_str::<PubMessage>(b.as_str())?,
+                Message::Text(b) => {
+                    num_messages += 1;
+                    serde_json::from_str::<PubMessage>(b.as_str())?
+                }
                 Message::Ping(_) => {
                     println!("ping");
                     continue;
@@ -65,24 +70,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         println!("Elapsed time: {:?}", now.elapsed());
     }
 
-    writr.close().await?;
-
-    println!("Connecting to other");
-    let (stream, _) = connect_async("ws://localhost:8080/other").await?;
-
-    let (mut writr, mut recvr) = stream.split();
-
     writr
-        .send(Message::Binary(Bytes::from("Hello from other")))
+        .send(Message::Binary(Bytes::from(
+            server_sub.update_parameters(5_u16, 30_u16)?,
+        )))
         .await?;
-    for _ in 0..10 {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let Some(data) = recvr.next().await else {
-            continue;
-        };
-        println!("{:?}", data)
-    }
 
+    recvr.next().await;
+    recvr.next().await;
+    writr
+        .send(Message::Binary(Bytes::from(server_sub.submit_buy(15_f32)?)))
+        .await?;
+
+    let _close_message = server_sub.close_connection();
     writr.close().await?;
 
     Ok(())
