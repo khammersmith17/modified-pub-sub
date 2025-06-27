@@ -1,6 +1,11 @@
+use futures::stream::{SplitSink, SplitStream};
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tungstenite::Message;
 /*
 * 5 possible states:
 * HandShake
@@ -144,6 +149,53 @@ impl ServerSubscription {
         Ok(message)
     }
 
+    pub async fn assert_server_state<T>(
+        &self,
+        writr: &mut SplitSink<WebSocketStream<T>, Message>,
+        recvr: &mut SplitStream<WebSocketStream<T>>,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let message =
+            serde_json::to_string::<MessageParameters>(&MessageParameters::ServerState {
+                symbol: &self.symbol,
+            })?;
+
+        writr
+            .send(tungstenite::Message::Binary(bytes::Bytes::from(message)))
+            .await?;
+
+        let mut recv_message_opt: Option<ServerStateAssertion> = None;
+
+        while recv_message_opt.is_none() {
+            let Some(message) = recvr.next().await else {
+                return Err("No message".into());
+            };
+
+            match message {
+                Ok(m) => match m {
+                    Message::Text(t) => {
+                        let message = serde_json::from_str::<ServerStateAssertion>(&t)?;
+                        recv_message_opt = Some(message);
+                    }
+                    Message::Binary(b) => {
+                        let message = serde_json::from_slice::<ServerStateAssertion>(&b)?;
+                        recv_message_opt = Some(message);
+                    }
+                    Message::Close(_) => return Err("Connection Closed".into()),
+                    _ => continue,
+                },
+                Err(_) => {
+                    todo!()
+                }
+            };
+        }
+        let server_state = recv_message_opt.unwrap();
+        assert_eq!(server_state.stake, self.current_stake);
+        Ok(())
+    }
+
     pub fn submit_buy(&mut self, order_amount: f32) -> ServerMessageResult {
         let new_position_value = self.current_stake + order_amount;
         self.previous_stake = self.current_stake;
@@ -246,6 +298,9 @@ pub enum MessageParameters<'de> {
         publish_cadence: u16,
         window: u16,
     },
+    ServerState {
+        symbol: &'de str,
+    },
     HandShake {
         symbol: &'de str,
     },
@@ -258,6 +313,12 @@ pub enum MessageParameters<'de> {
 pub struct PubMessage {
     #[allow(dead_code)]
     i: u16,
+}
+
+#[derive(Deserialize, Debug)]
+struct ServerStateAssertion {
+    symbol: String,
+    stake: f32,
 }
 
 #[cfg(test)]

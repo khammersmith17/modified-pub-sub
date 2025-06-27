@@ -2,9 +2,14 @@ from pydantic import BaseModel
 from enum import Enum
 import orjson
 from typing import TypeAlias, Union, Tuple
+from websockets import Data
 
 class PubMessage(BaseModel):
     i: int
+
+class ServerStateAssertion(BaseModel):
+    symbol: str
+    stake: float
 
 class MessageParameter(str, Enum):
     SubmitBuyOrder = "submitBuyOrder"
@@ -12,7 +17,11 @@ class MessageParameter(str, Enum):
     Subscribe = "subscribe"
     HandShake = "handShake"
     CloseConnection = "closeConnection"
+    ServerState = "serverState"
 
+
+class ServerState(BaseModel):
+    symbol: str
 
 class SubmitBuyOrder(BaseModel):
     buyOrder: float
@@ -36,11 +45,11 @@ class CloseConnection(BaseModel):
 
 
 ClientMessage: TypeAlias = Union[
-    SubmitBuyOrder, SubmitSellOrder, Subscribe, HandShake, CloseConnection
+    SubmitBuyOrder, SubmitSellOrder, Subscribe, HandShake, CloseConnection, ServerState
 ]
 
 
-def coerce_message_to_type(msg_str: bytes) -> Tuple[MessageParameter, ClientMessage]:
+def coerce_message_to_type(msg_str: Data) -> Tuple[MessageParameter, ClientMessage]:
     try:
         msg = orjson.loads(msg_str)
     except orjson.JSONDecodeError:
@@ -64,4 +73,6 @@ def coerce_message_to_type(msg_str: bytes) -> Tuple[MessageParameter, ClientMess
             data = HandShake(**params)
         case MessageParameter.CloseConnection:
             data = CloseConnection(**params)
+        case MessageParameter.ServerState:
+            data = ServerState(**params)
     return (msg_type, data)

@@ -6,7 +6,7 @@ from websockets import (
     Data,
 )
 from pydantic import ValidationError
-from data_types import MessageParameter, Subscribe, coerce_message_to_type, PubMessage
+from data_types import MessageParameter, Subscribe, coerce_message_to_type, PubMessage, ServerStateAssertion, ServerState
 from typing import Tuple, Optional
 import asyncio
 import logging
@@ -18,13 +18,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("logger")
 
 
-async def listen_for_interrupt(conn: ServerConnection):
-    interupt = await conn.recv()
-    return interupt
-
-
-async def publish_messages(sub_params: Subscribe, conn: ServerConnection):
-    logger.info("publishing messages")
+async def publish_messages(sub_params: Subscribe, conn: ServerConnection) -> None:
+    """
+    Publish messages to the client
+    args:
+        sub_params: Subscribe - subscription parameters
+        conn: ServerConnection - the websocket connection object
+        TODO:
+            ibkr_client: The IBKR client to request and publish messages
+    returns:
+        None
+    """
     num_messages = sub_params.window // sub_params.publishCadence
     logger.info(f"num_messages: {num_messages}")
     for i in range(num_messages):
@@ -41,7 +45,7 @@ async def pub_sub(
     conn: ServerConnection, sub_params: Subscribe
 ) -> Tuple[bool, Optional[Data]]:
     """
-    Publishes messages for the duration of the sub window
+    Orchestrates publishing messages for the duration of the sub window
     Allows for an interupt when a new message is recieved
     args:
         conn: ServerConnection - the object holding the connection state
@@ -83,7 +87,7 @@ async def connection_handler(conn: ServerConnection):
             # wait until the client sends a valid handshake
             msg = await conn.recv()
             try:
-                t, hs = coerce_message_to_type(msg_str=msg)  # pyright: ignore
+                t, hs = coerce_message_to_type(msg_str=msg)
             except ValidationError:
                 await conn.send('"error": "Invalid Message"'.encode("utf-8"))
                 continue
@@ -100,19 +104,21 @@ async def connection_handler(conn: ServerConnection):
         logger.info(f"first message after handshake: {msg}")
         while True:
             try:
-                t, msg_data = coerce_message_to_type(msg_str=msg)  # pyright: ignore
+                assert msg is not None
+                t, msg_data = coerce_message_to_type(msg_str=msg)
             except ValidationError:
                 logger.info(f"message was invalid: {msg}")
                 await conn.send('"error": "Invalid Message"'.encode("utf-8"))
+                continue
+            except AssertionError:
+                logger.info("msg is None when trying to read message type and data")
                 continue
 
             logger.info(f"t:\n{t}\nmsg_data:{msg_data}")
             match t:
                 case MessageParameter.SubmitBuyOrder:
                     stake_in = msg_data.buyOrder  # pyright: ignore
-                    print(state_db)
                     await state_db.buy(symbol, stake_in)
-                    print(state_db)
                     # TODO: submit buy order on IBKR here
                 case MessageParameter.SubmitSellOrder:
                     stake_out = msg_data.sellOrder  # pyright: ignore
@@ -130,6 +136,13 @@ async def connection_handler(conn: ServerConnection):
                     return
                 case MessageParameter.HandShake:
                     pass
+                case MessageParameter.ServerState:
+                    assert isinstance(msg_data, ServerState)
+                    stake = await state_db.get(msg_data.symbol) 
+                    assert stake is not None
+                    rx_msg = ServerStateAssertion(symbol=msg_data.symbol, stake=stake).model_dump_json() 
+                    await conn.send(rx_msg)
+
             msg = await conn.recv()
     except ConnectionClosedOK:
         logger.info("client closed connection")

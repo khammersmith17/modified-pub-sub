@@ -4,7 +4,6 @@ use std::error::Error;
 use tokio_tungstenite::connect_async;
 use tungstenite::Message;
 mod types;
-use bincode::config;
 use std::time::Instant;
 use types::{PubMessage, ServerSubscription};
 
@@ -15,7 +14,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     let (mut writr, mut recvr) = stream.split();
 
-    let bincode_config = config::standard();
     let mut server_sub = ServerSubscription::new(String::from("symbol"));
 
     writr
@@ -38,8 +36,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         let recv_message = match data {
             Ok(m) => match m {
                 Message::Binary(b) => {
-                    let (decoded_data, _n) =
-                        bincode::serde::decode_from_slice::<PubMessage, _>(&b, bincode_config)?;
+                    let decoded_data = serde_json::from_slice::<PubMessage>(&b)?;
                     num_messages += 1;
                     decoded_data
                 }
@@ -81,6 +78,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     writr
         .send(Message::Binary(Bytes::from(server_sub.submit_buy(15_f32)?)))
         .await?;
+
+    match server_sub.assert_server_state(&mut writr, &mut recvr).await {
+        Ok(_) => println!("assertion successful"),
+        Err(_) => println!("Error in assertion"),
+    };
 
     let _close_message = server_sub.close_connection();
     writr.close().await?;
