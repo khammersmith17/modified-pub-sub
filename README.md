@@ -25,17 +25,14 @@
 - the message broker may also aggregate the events based on the publishing cadence the client has requested
 ## Subscription
 - client will connect via a websocket to the server
-- once the hadnshake is established, client will send up to the server the length of the subscription and at what cadence messages should be published
-- this signifies the client has subscribed for some period of time
+- once the handshake is established, client will send up to the server the cadence messages should be published
+- this signifies the client has subscribed for some indefinite period of time
 - the client will then wait for messages to be publihsed at the rate they subscribed to
-- at the end of the subscribed window, the client then will then choose what it wants to do next
-- this can one of the following
-    - subscribe with the same parameters
-    - subscribe with new parameters
-    - route to a the connection to an another service on the message broker to perform some transaction within the transaction service
-    - close the connection as the lifecycle of the entity is complete
 - the client will need to listen for the messages and determine whether it is a ping message, if so return a pong message
 - when the message is a pub from the broker, the message will be consumed and use in within the application logic
+- when the client wants to perform some action on the transaction service, the client send a message describing the action
+- the current subscription is then interrupted
+- when the server acknowledges the action, then the client can resubscribe
 ## Publish
 - There are two main ways the client can prompt the message broker to perform some action on the server
 1. Action is performed at the end of a micro-subscription

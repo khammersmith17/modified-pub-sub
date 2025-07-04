@@ -7,6 +7,9 @@ from math import floor, ceil
 from ib_async import Ticker
 
 
+type Number = Union[int, float]
+
+
 class StockPosition:
     __slots__ = ["_dollars", "_cents"]
 
@@ -17,7 +20,7 @@ class StockPosition:
     @classmethod
     def from_float(cls, value: float) -> Self:
         dollars: int = int(floor(value))
-        cents:int = int(ceil((value - dollars) * 100))
+        cents: int = int(ceil((value - dollars) * 100))
         return cls(dollars=dollars, cents=cents)
 
     @classmethod
@@ -60,6 +63,7 @@ class OrderType(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
 
+
 class PubMessage(BaseModel):
     i: int
 
@@ -74,19 +78,22 @@ class TickerMessage(BaseModel):
     @classmethod
     def from_ticker(cls, ticker: Ticker):
         return cls(
-            h=ticker.high,
-            l=ticker.low,
-            c=ticker.close,
-            o=ticker.open,
-            v=ticker.volume
+            h=ticker.high, l=ticker.low, c=ticker.close, o=ticker.open, v=ticker.volume
         )
+
 
 class HandshakeStatus(str, Enum):
     SUCCESS = "Sucess"
     FAILED = "Failed"
 
+
 class HandshakeAck(BaseModel):
     status: HandshakeStatus
+
+
+class OrderAck(BaseModel):
+    orderType: OrderType
+    orderSize: Number
 
 
 class ServerStateAssertion(BaseModel):
@@ -108,11 +115,11 @@ class ServerState(BaseModel):
 
 
 class SubmitBuyOrder(BaseModel):
-    buyOrder: float
+    buyOrder: Number
 
 
 class SubmitSellOrder(BaseModel):
-    sellOrder: float
+    sellOrder: Number
 
 
 class Subscribe(BaseModel):

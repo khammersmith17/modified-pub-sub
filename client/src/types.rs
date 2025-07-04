@@ -43,10 +43,13 @@ pub enum HandshakeStatus {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct HandshakeAck {
     status: HandshakeStatus,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BaseTicker {
     h: f32,
     l: f32,
@@ -70,6 +73,7 @@ impl<'a, T> Index<usize> for CircularBuffer<T> {
     }
 }
 
+#[allow(dead_code)]
 impl<T> CircularBuffer<T>
 where
     T: Default + Clone,
@@ -149,24 +153,6 @@ impl Display for StateError {
 }
 
 impl Error for StateError {}
-
-/*
-struct ActivePosition {
-    symbol: String,
-    position: f32,
-}
-
-impl ActivePosition {
-    fn sell(&mut self, sell_volume: f32) {
-        debug_assert!(self.position > 0_f32);
-        self.position -= sell_volume;
-    }
-
-    fn buy(&mut self, buy_volume: f32) {
-        self.position += buy_volume;
-    }
-}
-*/
 
 #[derive(Default)]
 struct SubParameters {
