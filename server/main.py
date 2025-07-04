@@ -6,8 +6,20 @@ from websockets import (
     Data,
 )
 from pydantic import ValidationError
-from data_types import MessageParameter, Subscribe, coerce_message_to_type, PubMessage, ServerStateAssertion, ServerState
-from typing import Tuple, Optional
+from data_types import (
+    MessageParameter,
+    Subscribe,
+    coerce_message_to_type,
+    PubMessage,
+    HandshakeAck,
+    ServerStateAssertion,
+    ServerState,
+    HandshakeStatus,
+    Handshake,
+    OrderType
+)
+from ib_async import IB, Stock, Ticker, MarketOrder, Contract
+from typing import Tuple, Optional, Union
 import asyncio
 import logging
 from db import Database
@@ -17,10 +29,15 @@ state_db = Database()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("logger")
 
+ORDER_STATUS_POLL_CADENCE: float = 0.001 # Poll every millisecond
+IBKR_IP_ADDRESS = ""
+IBKR_PORT = 0
 
-async def publish_messages(sub_params: Subscribe, conn: ServerConnection) -> None:
+
+async def publish_messages(sub_params: Subscribe, conn: ServerConnection, ibkr_ticker: Ticker) -> None:
     """
-    Publish messages to the client
+    Publish messages to the client indefinitely until these is an interrupt
+    Leverages a Ticker from IBKR to get the relevant messages
     args:
         sub_params: Subscribe - subscription parameters
         conn: ServerConnection - the websocket connection object
@@ -29,20 +46,25 @@ async def publish_messages(sub_params: Subscribe, conn: ServerConnection) -> Non
     returns:
         None
     """
-    num_messages = sub_params.window // sub_params.publishCadence
-    logger.info(f"num_messages: {num_messages}")
-    for i in range(num_messages):
-        # get the tickers
-        logger.info("publishing single message")
+    logger.info(f"Publishing messages at cadence: {sub_params.publishCadence}")
+    i = 0
+    while True:
         message = PubMessage(i=i).model_dump_json()
         start = time()
         await conn.send(message)
         await asyncio.sleep(sub_params.publishCadence - (time() - start))
-    return
+        i += 1
+
+
+async def place_order(ib_client: IB, contract: Contract, order_type: OrderType, order_value: Union[float, int]):
+    order = MarketOrder(order_type.value, order_value)
+    trade = ib_client.placeOrder(contract, order)
+    while not trade.isDone():
+        await asyncio.sleep(ORDER_STATUS_POLL_CADENCE)
 
 
 async def pub_sub(
-    conn: ServerConnection, sub_params: Subscribe
+    conn: ServerConnection, sub_params: Subscribe, ibkr_ticker: Ticker
 ) -> Tuple[bool, Optional[Data]]:
     """
     Orchestrates publishing messages for the duration of the sub window
@@ -59,7 +81,7 @@ async def pub_sub(
     """
     logger.info("Handling subscription")
     publish_task = asyncio.create_task(
-        publish_messages(sub_params=sub_params, conn=conn)
+        publish_messages(sub_params=sub_params, conn=conn, ibkr_ticker=ibkr_ticker)
     )
     interupt_task = asyncio.create_task(conn.recv())
     done, _ = await asyncio.wait(
@@ -80,11 +102,22 @@ async def pub_sub(
         return (False, None)
 
 
+"""
+TODO:
+1. Upon successful handshake, an ib_async_client will be created
+    a. get id from db
+    b. connect async
+    c. acknowledge to the client that a connection was successfully made
+"""
+
 async def connection_handler(conn: ServerConnection):
     logger.info("accepted connection")
+    ib_client: IB = IB()
+    contract: Optional[Stock] = None
+
     try:
+        # listen until a valid handshake message it passed by the client
         while True:
-            # wait until the client sends a valid handshake
             msg = await conn.recv()
             try:
                 t, hs = coerce_message_to_type(msg_str=msg)
@@ -92,11 +125,19 @@ async def connection_handler(conn: ServerConnection):
                 await conn.send('"error": "Invalid Message"'.encode("utf-8"))
                 continue
             if t == MessageParameter.HandShake:
-                symbol = hs.symbol  # pyright: ignore
+                assert isinstance(hs, Handshake), "Message passed was not a handshake"
+                symbol = hs.symbol
+                contract = Stock(symbol)
                 await state_db.insert(symbol)
+                new_id = await state_db.new_id()
+                await ib_client.connectAsync(IBKR_IP_ADDRESS, IBKR_PORT, clientId=new_id)
                 break
             else:
-                await conn.send('"error": "Invalid HandShake"')
+                # if the first message was not a handshake, then we acknowledge we recieved but indicate bad message
+                await conn.send(HandshakeAck(status=HandshakeStatus.FAILED).model_dump_json().encode("utf-8"))
+
+        # acknowledge successful handshake
+        await conn.send(HandshakeAck(status=HandshakeStatus.SUCCESS).model_dump_json().encode("utf-8"))
 
         logger.info(f"aquired handshake: {symbol}")
 
@@ -118,16 +159,19 @@ async def connection_handler(conn: ServerConnection):
             match t:
                 case MessageParameter.SubmitBuyOrder:
                     stake_in = msg_data.buyOrder  # pyright: ignore
-                    await state_db.buy(symbol, stake_in)
+                    assert isinstance(stake_in, float)
+                    await state_db.buy(symbol, stake_in) # TODO: 
                     # TODO: submit buy order on IBKR here
                 case MessageParameter.SubmitSellOrder:
                     stake_out = msg_data.sellOrder  # pyright: ignore
-                    await state_db.sell(symbol, stake_out)
+                    assert isinstance(stake_out, float)
+                    await state_db.sell(symbol, stake_out) # TODO: 
                     # TODO: submit sell order on IBKR here
                 case MessageParameter.Subscribe:
+                    ticker = ib_client.reqMktData(contract, "", False, False)
                     interupted, msg = await pub_sub(
-                        conn=conn, sub_params=msg_data # pyright: ignore
-                    )  
+                        conn=conn, sub_params=msg_data, ibkr_ticker=ticker# pyright: ignore
+                    )
                     if interupted:
                         # breaking this step to process the interupt message
                         continue
@@ -138,9 +182,11 @@ async def connection_handler(conn: ServerConnection):
                     pass
                 case MessageParameter.ServerState:
                     assert isinstance(msg_data, ServerState)
-                    stake = await state_db.get(msg_data.symbol) 
+                    stake = await state_db.get(msg_data.symbol)
                     assert stake is not None
-                    rx_msg = ServerStateAssertion(symbol=msg_data.symbol, stake=stake).model_dump_json() 
+                    rx_msg = ServerStateAssertion(
+                        symbol=msg_data.symbol, stake=stake # TODO:
+                    ).model_dump_json()
                     await conn.send(rx_msg)
 
             msg = await conn.recv()

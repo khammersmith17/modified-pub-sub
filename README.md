@@ -55,3 +55,15 @@
 - Assertions will be used during development and maybe production
     - Client will request connection state from the message broker and perform assertions to make sure state is consistent
 
+
+## Protocol
+Here we define the three actors as so:
+- Client: Where core application logic sits
+- Message Broker: The broker between the transaction service and the core application logic
+- Transaction Service: Where transactions occur
+1. Every Connection will start with a Handshake
+    a. Client will connect with some parameters that will be used to connect to the transaction service
+    b. Message Broker will attempt to create a connection to the transaction service
+    c. Upon success, the message broker will acknowledge the handshake with the Client
+    d. Upon failure, the message broker will communicate reason. ie client error, transaction service connection error, etc
+2. Following wil be some comination of subscription windows/submit transactions

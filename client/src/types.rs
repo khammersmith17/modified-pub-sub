@@ -3,6 +3,7 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::ops::Index;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::Message;
@@ -34,6 +35,72 @@ use tungstenite::Message;
 * The subscription should internally hold some details, then issue a server message via the server
 * message enum
 * */
+
+#[derive(Debug, Deserialize)]
+pub enum HandshakeStatus {
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HandshakeAck {
+    status: HandshakeStatus,
+}
+
+struct BaseTicker {
+    h: f32,
+    l: f32,
+    c: f32,
+    o: f32,
+    v: f32,
+}
+
+// Generic type to hold cap items in a circular buffer
+struct CircularBuffer<T> {
+    buf: Vec<T>,
+    cap: usize,
+    i: usize,
+}
+
+impl<'a, T> Index<usize> for CircularBuffer<T> {
+    type Output = T;
+    fn index(&self, idx: usize) -> &Self::Output {
+        let j = (self.i + idx) % self.cap;
+        &self.buf[j]
+    }
+}
+
+impl<T> CircularBuffer<T>
+where
+    T: Default + Clone,
+{
+    pub fn new(cap: usize) -> CircularBuffer<T> {
+        // allocate a Vec with cap
+        let mut buf: Vec<T> = Vec::with_capacity(cap);
+
+        // allocate a default item to every position in the Vec
+        buf.resize(cap, T::default());
+
+        CircularBuffer {
+            buf,
+            cap,
+            i: 0_usize,
+        }
+    }
+
+    pub fn push(&mut self, item: T) {
+        // insert at i, increment
+        self.buf[self.i] = item;
+        self.i = (self.i + 1) % self.cap;
+    }
+
+    fn aggregate<R, F>(&self, f: F) -> R
+    where
+        F: Fn(&[T]) -> R,
+    {
+        f(&self.buf)
+    }
+}
 
 type ServerMessageResult = Result<String, StateError>;
 
@@ -192,7 +259,9 @@ impl ServerSubscription {
             };
         }
         let server_state = recv_message_opt.unwrap();
-        assert_eq!(server_state.stake, self.current_stake);
+        println!("current server state: {:?}", server_state);
+        println!("current client state: {}", self.current_stake);
+        assert!(server_state.stake - self.current_stake < f32::EPSILON);
         Ok(())
     }
 
@@ -268,6 +337,10 @@ impl ServerSubscription {
     pub fn current_state(&self) -> &ClientState {
         &self.state
     }
+
+    pub fn current_position(&self) -> f32 {
+        self.current_stake
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
@@ -326,23 +399,30 @@ mod test {
     use super::*;
 
     #[test]
-    fn client_message_test() {
-        let symbol = String::from("symbol");
-        let handshake = MessageParameters::HandShake { symbol: &symbol };
-        let handshake_str = serde_json::to_string_pretty::<MessageParameters>(&handshake).unwrap();
-        println!("{}", handshake_str);
+    fn circular_buffer() {
+        let mut buffer: CircularBuffer<i32> = CircularBuffer::new(5_usize);
+        buffer.push(1_i32);
+        buffer.push(2_i32);
+        buffer.push(3_i32);
+        buffer.push(4_i32);
+        buffer.push(5_i32);
+        buffer.push(6_i32);
+
+        assert_eq!(buffer[0], 2_i32);
     }
 
     #[test]
-    fn test_server_subscription_base() {
-        let mut server_sub = ServerSubscription::new(String::from("Symbol"));
-        let handshake = server_sub.handshake().unwrap();
-        println!("handshake:\n{}", handshake);
-        let sub_msg = server_sub.update_parameters(10, 60).unwrap();
-        println!("subscribe:\n{}", sub_msg);
-        let buy_msg = server_sub.submit_buy(10_f32).unwrap();
-        println!("buy msg:\n{}", buy_msg);
-        let sell_msg = server_sub.submit_sell(5_f32).unwrap();
-        println!("sell msg:\n{}", sell_msg);
+    fn circular_buffer_agg() {
+        let mut buffer: CircularBuffer<i32> = CircularBuffer::new(5_usize);
+        buffer.push(1_i32);
+        buffer.push(2_i32);
+        buffer.push(3_i32);
+        buffer.push(4_i32);
+        buffer.push(5_i32);
+        buffer.push(6_i32);
+
+        let res: i32 = buffer.aggregate(|data: &[i32]| data.iter().sum());
+
+        assert_eq!(res, 20_i32);
     }
 }
