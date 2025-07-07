@@ -6,6 +6,7 @@ from websockets import (
 )
 from pydantic import ValidationError
 from data_types import (
+    TradingSession,
     MessageParameter,
     Subscribe,
     coerce_message_to_type,
@@ -13,12 +14,13 @@ from data_types import (
     ServerStateAssertion,
     ServerState,
     HandshakeStatus,
-    Handshake,
+    SessionHandshake,
+    RecoveryHandshake,
     OrderType,
 )
 from actions import pub_sub, place_order
 from ib_async import IB, Stock
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 import asyncio
 import logging
 from db import Database
@@ -42,47 +44,69 @@ TODO:
 4. On pub interrupt, perform the associated action
 """
 
-
-async def connection_handler(conn: ServerConnection):
-    logger.info("accepted connection")
-    ib_client: IB = IB()
-    contract: Optional[Stock] = None
-
+async def perform_handshake(conn: ServerConnection) -> Tuple[bool, Optional[TradingSession]]:
     try:
-        # listen until a valid handshake message it passed by the client
         while True:
-            msg = await conn.recv()
-            try:
-                t, hs = coerce_message_to_type(msg_str=msg)
-            except ValidationError:
-                await conn.send('"error": "Invalid Message"'.encode("utf-8"))
-                continue
-            if t == MessageParameter.HandShake:
-                assert isinstance(hs, Handshake), "Message passed was not a handshake"
+                msg = await conn.recv()
+                try:
+                    t, hs = coerce_message_to_type(msg_str=msg)
+                except ValidationError:
+                    await conn.send('"error": "Invalid Message"'.encode("utf-8"))
+                    continue
+                if t != MessageParameter.SessionHandshake or t != MessageParameter.RecoveryHandshake:
+                    # if the first message was not a handshake, then we acknowledge we recieved but indicate bad message
+                    await conn.send(
+                        HandshakeAck(status=HandshakeStatus.InvalidHandshake)
+                        .model_dump_json()
+                        .encode("utf-8")
+                    )
+                    continue
+                assert isinstance(hs, Union[SessionHandshake, RecoveryHandshake]), "Message passed was not a handshake"
                 symbol = hs.symbol
-                contract = Stock(symbol)
-                await state_db.insert(symbol)
-                new_id = await state_db.new_id()
-                await ib_client.connectAsync(
-                    IBKR_IP_ADDRESS, IBKR_PORT, clientId=new_id
-                )
+                if isinstance(hs, SessionHandshake):
+                    contract = Stock(symbol)
+                    ib_client = IB()
+                    new_id = await state_db.new_id()
+                    await ib_client.connectAsync(
+                        IBKR_IP_ADDRESS, IBKR_PORT, clientId=new_id
+                    )
+                    session = TradingSession(symbol=symbol, client=ib_client, publishCadence=hs.publishCadence, contract=contract, currentPosition=0.0)
+                    success = await state_db.insert(symbol, session)
+                else:
+                    session = await state_db.get(symbol)
+                    success = True if session is not None else False
+                if not success:
+                    # if new session there is another active session
+                    await conn.send(HandshakeAck.construct_handshake_error(hs))
+                    continue
                 break
-            else:
-                # if the first message was not a handshake, then we acknowledge we recieved but indicate bad message
-                await conn.send(
-                    HandshakeAck(status=HandshakeStatus.FAILED)
-                    .model_dump_json()
-                    .encode("utf-8")
-                )
 
-        # acknowledge successful handshake
+            # acknowledge successful handshake
         await conn.send(
-            HandshakeAck(status=HandshakeStatus.SUCCESS)
+            HandshakeAck(status=HandshakeStatus.Success)
             .model_dump_json()
             .encode("utf-8")
         )
+        return True, session
+    except ConnectionClosedOK:
+        logger.info("client closed connection")
+        return False, None 
+    except ConnectionClosedError:
+        logger.info("closed connection")
+        return False, None 
 
-        logger.info(f"aquired handshake: {symbol}")
+
+
+async def connection_handler(conn: ServerConnection):
+    logger.info("accepted connection")
+
+    try:
+        success, session = await perform_handshake(conn)
+        if not success:
+            return
+
+        assert session is not None, "Null session returned from successful handshake"
+        logger.info(f"aquired handshake: {session.symbol}")
 
         msg = await conn.recv()
         logger.info(f"first message after handshake: {msg}")
@@ -103,23 +127,22 @@ async def connection_handler(conn: ServerConnection):
                 case MessageParameter.SubmitBuyOrder:
                     stake_in = msg_data.buyOrder  # pyright: ignore
                     assert isinstance(stake_in, Union[float, int])
-                    await state_db.buy(symbol, stake_in)
+                    await state_db.buy(session.symbol, stake_in)
                     ack = await place_order(
-                        ib_client=ib_client,
-                        contract=contract,
-                        order_type=OrderType.BUY,
+                        ib_client=session.client,
+                        contract=session.contract,
+                        order_type=OrderType.Buy,
                         order_value=stake_in,
                     )
-
                     await conn.send(ack.model_dump_json().encode("utf-8"))
                 case MessageParameter.SubmitSellOrder:
                     stake_out = msg_data.sellOrder  # pyright: ignore
                     assert isinstance(stake_out, Union[float, int])
-                    await state_db.sell(symbol, stake_out)
+                    await state_db.sell(session.symbol, stake_out)
                     ack = await place_order(
-                        ib_client=ib_client,
-                        contract=contract,
-                        order_type=OrderType.SELL,
+                        ib_client=session.client,
+                        contract=session.contract,
+                        order_type=OrderType.Sell,
                         order_value=stake_out,
                     )
                     await conn.send(ack.model_dump_json().encode("utf-8"))
@@ -127,7 +150,7 @@ async def connection_handler(conn: ServerConnection):
                     assert isinstance(
                         msg_data, Subscribe
                     ), "Subscribe message is wrong type"
-                    ticker = ib_client.reqMktData(contract, "", False, False)
+                    ticker = session.client.reqMktData(session.contract, "", False, False)
                     msg = await pub_sub(
                         conn=conn,
                         sub_params=msg_data,
@@ -137,17 +160,14 @@ async def connection_handler(conn: ServerConnection):
                 case MessageParameter.CloseConnection:
                     await conn.close()
                     return
-                case MessageParameter.HandShake:
-                    pass
                 case MessageParameter.ServerState:
                     assert isinstance(msg_data, ServerState)
-                    stake = await state_db.get(msg_data.symbol)
-                    assert stake is not None
+                    session = await state_db.get(msg_data.symbol)
+                    assert session is not None
                     rx_msg = ServerStateAssertion(
-                        symbol=msg_data.symbol, stake=stake
+                        symbol=msg_data.symbol, stake=session.currentPosition
                     ).model_dump_json()
                     await conn.send(rx_msg)
-
             msg = await conn.recv()
     except ConnectionClosedOK:
         logger.info("client closed connection")

@@ -4,7 +4,7 @@ import orjson
 from typing import TypeAlias, Union, Tuple, Self, Optional
 from websockets import Data
 from math import floor, ceil
-from ib_async import Ticker
+from ib_async import Ticker, Stock, IB
 
 
 type Number = Union[int, float]
@@ -58,10 +58,17 @@ class StockPosition:
                 "Cannot add a non StockPosition instance to a StockPosition instance"
             )
 
+class TradingSession(BaseModel):
+    symbol: str
+    client: IB
+    contract: Stock
+    publishCadence: int
+    currentPosition: Number
+
 
 class OrderType(str, Enum):
-    BUY = "BUY"
-    SELL = "SELL"
+    Buy = "BUY"
+    Sell = "SELL"
 
 
 class PubMessage(BaseModel):
@@ -83,12 +90,10 @@ class TickerMessage(BaseModel):
 
 
 class HandshakeStatus(str, Enum):
-    SUCCESS = "Sucess"
-    FAILED = "Failed"
+    Success = "Sucess"
+    InvalidHandshake = "InvalidHandshake"
+    SymbolInUse = "SymbolInUse"
 
-
-class HandshakeAck(BaseModel):
-    status: HandshakeStatus
 
 
 class OrderAck(BaseModel):
@@ -105,7 +110,8 @@ class MessageParameter(str, Enum):
     SubmitBuyOrder = "submitBuyOrder"
     SubmitSellOrder = "submitSellOrder"
     Subscribe = "subscribe"
-    HandShake = "handShake"
+    SessionHandshake = "sessionHandshake"
+    RecoveryHandshake = "recoveryHandshake"
     CloseConnection = "closeConnection"
     ServerState = "serverState"
 
@@ -126,8 +132,29 @@ class Subscribe(BaseModel):
     publishCadence: int
 
 
-class Handshake(BaseModel):
+class SessionHandshake(BaseModel):
+    """
+    symbol: the stock symbol of the session
+    publishCadence: the cadence at which to publish messages in seconds
+    """
     symbol: str
+    publishCadence: int
+
+class RecoveryHandshake(BaseModel):
+    symbol: str
+
+
+class HandshakeAck(BaseModel):
+    status: HandshakeStatus
+
+    @classmethod
+    def construct_handshake_error(cls, hs: Union[SessionHandshake, RecoveryHandshake]) -> bytes:
+        if isinstance(hs, SessionHandshake):
+            return cls(status=HandshakeStatus.SymbolInUse).model_dump_json().encode("utf-8")
+        else:
+            return cls(status=HandshakeStatus.InvalidHandshake).model_dump_json().encode("utf-8")
+
+
 
 
 class CloseConnection(BaseModel):
@@ -135,7 +162,7 @@ class CloseConnection(BaseModel):
 
 
 ClientMessage: TypeAlias = Union[
-    SubmitBuyOrder, SubmitSellOrder, Subscribe, Handshake, CloseConnection, ServerState
+    SubmitBuyOrder, SubmitSellOrder, Subscribe, SessionHandshake, CloseConnection, ServerState, RecoveryHandshake
 ]
 
 
@@ -159,8 +186,10 @@ def coerce_message_to_type(msg_str: Data) -> Tuple[MessageParameter, ClientMessa
             data = SubmitSellOrder(**params)
         case MessageParameter.Subscribe:
             data = Subscribe(**params)
-        case MessageParameter.HandShake:
-            data = Handshake(**params)
+        case MessageParameter.SessionHandshake:
+            data = SessionHandshake(**params)
+        case MessageParameter.RecoveryHandshake:
+            data = SessionHandshake(**params)
         case MessageParameter.CloseConnection:
             data = CloseConnection(**params)
         case MessageParameter.ServerState:
