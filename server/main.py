@@ -133,13 +133,13 @@ async def connection_handler(conn: ServerConnection):
         logger.info(f"aquired handshake: {session.symbol}")
 
         while True:
-            ticker = session.client.reqMktData(
-                session.contract, "", False, False
+            bars = session.client.reqRealTimeBars(
+                contract=session.contract, barSize=5, whatToShow="TRADES", useRTH=False
             )
             msg = await pub_sub(
                 conn=conn,
                 cadence=session.publishCadence,
-                ibkr_ticker=ticker,
+                ibkr_ticker=bars,
             )
 
             try:
@@ -157,26 +157,31 @@ async def connection_handler(conn: ServerConnection):
                 case MessageParameter.SubmitBuyOrder:
                     stake_in = msg_data.buyOrder  # pyright: ignore
                     assert isinstance(stake_in, Union[float, int])
-                    await state_db.buy(session.symbol, stake_in)
                     ack = await place_order(
                         ib_client=session.client,
                         contract=session.contract,
                         order_type=OrderType.Buy,
                         order_value=stake_in,
                     )
+
+                    # update state only with the amount of the order that was filled
+                    await state_db.buy(session.symbol, ack.filled)
                     await conn.send(ack.model_dump_json().encode("utf-8"))
                 case MessageParameter.SubmitSellOrder:
                     stake_out = msg_data.sellOrder  # pyright: ignore
                     assert isinstance(stake_out, Union[float, int])
-                    await state_db.sell(session.symbol, stake_out)
                     ack = await place_order(
                         ib_client=session.client,
                         contract=session.contract,
                         order_type=OrderType.Sell,
                         order_value=stake_out,
                     )
+
+                    # update state only with the amount of the order that was filled
+                    await state_db.sell(session.symbol, ack.filled)
                     await conn.send(ack.model_dump_json().encode("utf-8"))
                 case MessageParameter.UpdateSubscription:
+                    # this will seldom be used in the beginning
                     assert isinstance(
                         msg_data, UpdateSubscription
                     ), "Subscribe message is wrong type"

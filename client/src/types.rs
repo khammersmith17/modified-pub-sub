@@ -1,11 +1,11 @@
+use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::ops::Index;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 /*
 * 5 possible states:
@@ -20,8 +20,9 @@ use tungstenite::Message;
 *
 *----Valid state changes----
 * HandShake -> Buying
-* Buying -> Subscribing
-* Selling -> Subscribing
+* Handshake -> Subscribed
+* Buying -> Subscribed
+* Selling -> Subscribed
 * Subscribing -> Buying
 * Subscribing -> Selling
 * Selling -> Closed
@@ -185,12 +186,62 @@ impl ServerSubscription {
         self.generate_server_message()
     }
 
-    pub fn handshake(&self) -> ServerMessageResult {
-        if !matches!(self.state, ClientState::HandShake) {
-            return Err(StateError::new(StateErrorVariant::HandShake));
-        }
+    pub async fn handshake<T>(
+        &self,
+        writr: &mut SplitSink<WebSocketStream<T>, Message>,
+        recvr: &mut SplitStream<WebSocketStream<T>>,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        // generate the handshake message
+        // if there is an error on the message broker, try again
+        let base_m = ServerMessage::HandShake {
+            symbol: &self.symbol,
+        };
 
-        self.generate_server_message()
+        let msg = serde_json::to_string::<ServerMessage>(&base_m)?;
+
+        writr.send(Message::Binary(Bytes::from(msg))).await?;
+
+        while let Some(ack) = recvr.next().await {
+            match ack {
+                Ok(s_ack) => match s_ack {
+                    Message::Binary(m) => {
+                        let ack_m = serde_json::from_slice::<HandshakeAck>(&m)?;
+                        if matches!(ack_m.status, HandshakeStatus::Success) {
+                            return Ok(());
+                        } else {
+                            return Err("Handshake not successful".into());
+                        }
+                    }
+                    Message::Text(m) => {
+                        let ack_m = serde_json::from_str::<HandshakeAck>(&m)?;
+                        if matches!(ack_m.status, HandshakeStatus::Success) {
+                            return Ok(());
+                        } else {
+                            return Err("Handshake not successful".into());
+                        }
+                    }
+                    Message::Ping(m) => {
+                        // pong back with
+                        writr.send(Message::Pong(m)).await?;
+                    }
+                    Message::Pong(_) => {
+                        // can safely accept a pong and let this be an acknowledgement of a live
+                        // connection
+                        continue;
+                    }
+                    Message::Close(m) => {
+                        writr.send(Message::Close(m)).await?;
+                        return Err("Connection closed before handshake recieved".into());
+                    }
+                    _ => return Err("recieved incomplete message".into()),
+                },
+                Err(e) => return Err(format!("Handshake not successful: {:?}", e).into()),
+            }
+        }
+        todo!()
     }
 
     #[allow(dead_code)]
@@ -210,10 +261,9 @@ impl ServerSubscription {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let message =
-            serde_json::to_string::<MessageParameters>(&MessageParameters::ServerState {
-                symbol: &self.symbol,
-            })?;
+        let message = serde_json::to_string::<ServerMessage>(&ServerMessage::ServerState {
+            symbol: &self.symbol,
+        })?;
 
         writr
             .send(tungstenite::Message::Binary(bytes::Bytes::from(message)))
@@ -279,35 +329,35 @@ impl ServerSubscription {
     fn generate_server_message(&self) -> ServerMessageResult {
         let message: Result<String, serde_json::Error> = match self.state {
             ClientState::HandShake => {
-                let handshake_message = MessageParameters::HandShake {
+                let handshake_message = ServerMessage::HandShake {
                     symbol: &self.symbol,
                 };
-                serde_json::to_string::<MessageParameters>(&handshake_message)
+                serde_json::to_string::<ServerMessage>(&handshake_message)
             }
             ClientState::Buying => {
                 let buy_order = self.current_stake - self.previous_stake;
-                let buy_message = MessageParameters::SubmitBuyOrder { buy_order };
+                let buy_message = ServerMessage::SubmitBuyOrder { buy_order };
 
-                serde_json::to_string::<MessageParameters>(&buy_message)
+                serde_json::to_string::<ServerMessage>(&buy_message)
             }
             ClientState::Selling => {
                 let sell_order = self.previous_stake - self.current_stake;
-                let sell_message = MessageParameters::SubmitSellOrder { sell_order };
+                let sell_message = ServerMessage::SubmitSellOrder { sell_order };
 
-                serde_json::to_string::<MessageParameters>(&sell_message)
+                serde_json::to_string::<ServerMessage>(&sell_message)
             }
             ClientState::Subscribed => {
-                let message = MessageParameters::Subscribe {
+                let message = ServerMessage::Subscribe {
                     publish_cadence: self.sub_parameters.cadence,
                     window: self.sub_parameters.window,
                 };
 
-                serde_json::to_string::<MessageParameters>(&message)
+                serde_json::to_string::<ServerMessage>(&message)
             }
             ClientState::Closing => {
                 let status = String::from("OK");
-                let message = MessageParameters::CloseConnection { status: &status };
-                serde_json::to_string::<MessageParameters>(&message)
+                let message = ServerMessage::CloseConnection { status: &status };
+                serde_json::to_string::<ServerMessage>(&message)
             }
             ClientState::Closed => {
                 return Err(StateError::new(StateErrorVariant::ConnectionClosed));
@@ -342,7 +392,7 @@ pub enum ClientState {
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub enum MessageParameters<'de> {
+pub enum ServerMessage<'de> {
     #[serde(rename_all = "camelCase")]
     SubmitBuyOrder {
         buy_order: f32,

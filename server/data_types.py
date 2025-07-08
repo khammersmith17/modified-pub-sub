@@ -4,7 +4,7 @@ import orjson
 from typing import TypeAlias, Union, Tuple, Self
 from websockets import Data
 from math import floor, ceil
-from ib_async import Ticker, Stock, IB
+from ib_async import Ticker, Stock, IB, RealTimeBar
 
 
 """
@@ -71,9 +71,6 @@ class StockPosition:
             )
 
 
-
-
-
 class OrderType(str, Enum):
     Buy = "BUY"
     Sell = "SELL"
@@ -91,9 +88,9 @@ class TickerMessage(BaseModel):
     v: float
 
     @classmethod
-    def from_ticker(cls, ticker: Ticker):
+    def from_ticker(cls, ticker: RealTimeBar):
         return cls(
-            h=ticker.high, l=ticker.low, c=ticker.close, o=ticker.open, v=ticker.volume
+            h=ticker.high, l=ticker.low, c=ticker.close, o=ticker.open_, v=ticker.volume
         )
 
 
@@ -105,6 +102,8 @@ class HandshakeStatus(str, Enum):
 
 class OrderAck(BaseModel):
     orderType: OrderType
+    filled: Number
+    remaining: Number
     orderSize: Number
 
 
@@ -177,6 +176,12 @@ class HandshakeAck(BaseModel):
 class CloseConnection(BaseModel):
     status: str
 
+
+class SimulatedClient:
+    def __init__(self, id: int):
+        self.id = id
+
+
 class TradingSession(BaseModel):
     symbol: str
     client: IB
@@ -186,6 +191,7 @@ class TradingSession(BaseModel):
 
     def update_sub_parameter(self, update: UpdateSubscription) -> None:
         self.publishCadence = update.publishCadence
+
 
 ClientMessage: TypeAlias = Union[
     SubmitBuyOrder,

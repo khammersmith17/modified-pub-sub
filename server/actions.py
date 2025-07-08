@@ -1,21 +1,18 @@
-from ib_async import IB, Ticker, Contract, MarketOrder
-from pydantic import ValidationError
-from data_types import (
-    Subscribe,
-    OrderType,
-    TickerMessage,
-    OrderAck,
-    coerce_message_to_type,
-    MessageParameter,
-    SessionHandshake,
-    RecoveryHandshake,
-    HandshakeStatus,
-    Number
+from ib_async import (
+    IB,
+    Ticker,
+    Contract,
+    LimitOrder,
+    RealTimeBarList,
+    LimitOrder,
+    Trade,
 )
+from pydantic import ValidationError
+from data_types import OrderType, TickerMessage, OrderAck, Number
 from time import time
 import asyncio
 from websockets import ServerConnection, Data
-from typing import Optional, Union, Tuple
+from typing import Union
 import logging
 
 logger = logging.getLogger("log")
@@ -23,8 +20,39 @@ logger = logging.getLogger("log")
 ORDER_STATUS_POLL_CADENCE: float = 0.001  # Poll every millisecond
 
 
+def create_order(
+    action: OrderType, totalQuantity: float, lmtPrice: float
+) -> LimitOrder:
+    return LimitOrder(
+        action=action.value, totalQuantity=totalQuantity, lmtPrice=lmtPrice, tif="IOC"
+    )
+
+
+async def wait_for_trade(trade: Trade):
+    done = asyncio.Event()
+
+    def is_done(_):
+        if trade.isDone():
+            done.set()
+
+    trade.cancelledEvent += is_done
+    trade.filledEvent += is_done
+
+    if trade.isDone():
+        return
+
+    await done.wait()
+
+
+def curry_bar_handler(queue: asyncio.Queue):
+    async def bar_handler(_, new_bar):
+        await queue.put(new_bar)
+
+    return bar_handler
+
+
 async def publish_messages(
-    cadence: Number, conn: ServerConnection, ibkr_ticker: Ticker
+    cadence: Number, conn: ServerConnection, ibkr_ticker: RealTimeBarList
 ) -> None:
     """
     Publish messages to the client indefinitely until these is an interrupt
@@ -37,11 +65,14 @@ async def publish_messages(
     returns:
         None
     """
+
+    queue = asyncio.Queue()
+    handler = curry_bar_handler(queue)
+    ibkr_ticker.updateEvent += handler
     logger.info(f"Publishing messages at cadence: {cadence}")
     while True:
-        message = (
-            TickerMessage.from_ticker(ibkr_ticker).model_dump_json().encode("utf-8")
-        )
+        ticker = await queue.get()
+        message = TickerMessage.from_ticker(ticker).model_dump_json().encode("utf-8")
         start = time()
         await conn.send(message)
         await asyncio.sleep(cadence - (time() - start))
@@ -53,19 +84,24 @@ async def place_order(
     order_type: OrderType,
     order_value: Union[float, int],
 ) -> OrderAck:
-    order = MarketOrder(order_type.value, order_value)
+    order = create_order(action=order_type, totalQuantity=order_value, lmtPrice=100.0)
     # TODO: determine the error handling logic here
     trade = ib_client.placeOrder(contract, order)
-    while not trade.isDone():
-        await asyncio.sleep(
-            ORDER_STATUS_POLL_CADENCE
-        )  # TODO: determine what a proper poll cadence is here, if any, timeout maybe?
 
-    return OrderAck(orderType=order_type, orderSize=order_value)
+    await wait_for_trade(trade)
+
+    filled = trade.filled()
+
+    return OrderAck(
+        orderType=order_type,
+        filled=filled,
+        remaining=order_value - filled,
+        orderSize=order_value,
+    )
 
 
 async def pub_sub(
-    conn: ServerConnection, cadence: Number, ibkr_ticker: Ticker
+    conn: ServerConnection, cadence: Number, ibkr_ticker: RealTimeBarList
 ) -> Data:
     """
     Orchestrates publishing messages for the duration of the sub window
