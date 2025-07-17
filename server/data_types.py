@@ -1,22 +1,20 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from enum import Enum
 import orjson
-from typing import TypeAlias, Union, Tuple, Self
+from typing import TypeAlias, Union, Tuple, Self, Optional
 from websockets import Data
 from math import floor, ceil
-from ib_async import Ticker, Stock, IB, RealTimeBar
+from random import uniform as random_uniform
+from ib_async import  Stock, IB, RealTimeBar
+import math
+from datetime import datetime, timedelta
 
 
-"""
-TODO:
-    clean up the message actions
-    create a better way to ack
-    probably 4 buckets
-    1. handshake ack
-    2. state update ack
-    3. server assertion ack
-    4. closing connection ack
-"""
+# TODO: closing connection ack?
+
+
+class MessageSerializationError(Exception):
+    pass
 
 
 type Number = Union[int, float]
@@ -72,12 +70,42 @@ class StockPosition:
 
 
 class OrderType(str, Enum):
-    Buy = "BUY"
-    Sell = "SELL"
+    Buy = "Buy"
+    Sell = "Sell"
+
+
+class SimulatedOrder(BaseModel):
+    order_type: OrderType
+    order_size: float
+
+
+class SimulatedTrade(BaseModel):
+    amt_filled: float
+    amt_remaining: float
+
+    def filled(self) -> float:
+        return self.amt_filled
 
 
 class PubMessage(BaseModel):
     i: int
+
+
+class SimulatedBar(BaseModel):
+    high: float
+    low: float
+    close: float
+    open_: float
+    volume: float
+    time: datetime
+
+    def perturb(self):
+        self.high *= random_uniform(0.95, 0.99)
+        self.low *= random_uniform(0.95, 0.99)
+        self.close *= random_uniform(0.95, 0.99)
+        self.open_ *= random_uniform(0.95, 0.99)
+        self.volume *= random_uniform(0.95, 0.99)
+        self.time += timedelta(seconds=5)
 
 
 class TickerMessage(BaseModel):
@@ -86,12 +114,16 @@ class TickerMessage(BaseModel):
     c: float
     o: float
     v: float
+    timestamp: int
 
     @classmethod
-    def from_ticker(cls, ticker: RealTimeBar):
+    def from_ticker(cls, ticker: Union[RealTimeBar, SimulatedBar]):
         return cls(
-            h=ticker.high, l=ticker.low, c=ticker.close, o=ticker.open_, v=ticker.volume
+            h=ticker.high, l=ticker.low, c=ticker.close, o=ticker.open_, v=ticker.volume, timestamp=int(math.floor(ticker.time.timestamp()))
         )
+
+class TickerPayload(BaseModel):
+    ticker: Optional[TickerMessage]
 
 
 class HandshakeStatus(str, Enum):
@@ -107,7 +139,7 @@ class OrderAck(BaseModel):
     orderSize: Number
 
 
-class ServerStateAssertion(BaseModel):
+class ServerStateAssertionAck(BaseModel):
     symbol: str
     stake: float
 
@@ -138,14 +170,21 @@ class UpdateSubscription(BaseModel):
     publishCadence: int
 
 
+class PositionType(str, Enum):
+    Long = "Long"
+    Short = "Short"
+
+
 class SessionHandshake(BaseModel):
     """
     symbol: the stock symbol of the session
     publishCadence: the cadence at which to publish messages in seconds
     """
 
+    model_config = ConfigDict(use_enum_values=True, extra="ignore")
     symbol: str
     publishCadence: int
+    positionType: PositionType
 
 
 class RecoveryHandshake(BaseModel):
@@ -183,8 +222,10 @@ class SimulatedClient:
 
 
 class TradingSession(BaseModel):
+    model_config = ConfigDict(use_enum_values=True, extra="ignore")
     symbol: str
     client: IB
+    positionType: PositionType
     contract: Stock
     publishCadence: int
     currentPosition: Number
@@ -209,11 +250,11 @@ def coerce_message_to_type(msg_str: Data) -> Tuple[MessageParameter, ClientMessa
         msg = orjson.loads(msg_str)
     except orjson.JSONDecodeError:
         raise ValueError(f"Invalid Json Error: {msg_str}")
-    type_key = list(msg.keys())[0]
     try:
+        type_key = list(msg.keys())[0]
         msg_type = MessageParameter(type_key)
-    except ValueError:
-        raise KeyError(f"Invalid message type: {type_key}")
+    except (ValueError, IndexError):
+        raise MessageSerializationError("Invalid message")
 
     params = msg.get(type_key)
     data = None
@@ -227,7 +268,7 @@ def coerce_message_to_type(msg_str: Data) -> Tuple[MessageParameter, ClientMessa
         case MessageParameter.SessionHandshake:
             data = SessionHandshake(**params)
         case MessageParameter.RecoveryHandshake:
-            data = SessionHandshake(**params)
+            data = RecoveryHandshake(**params)
         case MessageParameter.CloseConnection:
             data = CloseConnection(**params)
         case MessageParameter.ServerState:

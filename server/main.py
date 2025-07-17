@@ -6,19 +6,22 @@ from websockets import (
 )
 from pydantic import ValidationError
 from data_types import (
+    TickerPayload,
+    TickerMessage,
     TradingSession,
     MessageParameter,
     UpdateSubscription,
     coerce_message_to_type,
     HandshakeAck,
-    ServerStateAssertion,
+    ServerStateAssertionAck,
     ServerState,
     HandshakeStatus,
     SessionHandshake,
     RecoveryHandshake,
     OrderType,
 )
-from actions import pub_sub, place_order
+from time import time
+from actions import pub_sub, place_order, curry_bar_handler, service_client_action_request
 from ib_async import IB, Stock
 from typing import Optional, Union, Tuple
 import asyncio
@@ -84,6 +87,7 @@ async def perform_handshake(
                     client=ib_client,
                     publishCadence=hs.publishCadence,
                     contract=contract,
+                    positionType=hs.positionType,
                     currentPosition=0.0,
                 )
                 success = await state_db.insert(symbol, session)
@@ -193,10 +197,56 @@ async def connection_handler(conn: ServerConnection):
                     assert isinstance(msg_data, ServerState)
                     session = await state_db.get(msg_data.symbol)
                     assert session is not None
-                    rx_msg = ServerStateAssertion(
+                    rx_msg = ServerStateAssertionAck(
                         symbol=msg_data.symbol, stake=session.currentPosition
                     ).model_dump_json()
                     await conn.send(rx_msg)
+    except ConnectionClosedOK:
+        logger.info("client closed connection")
+    except ConnectionClosedError:
+        logger.info("closed connection")
+    logger.info("exiting connection")
+
+async def connection_handler_v2(conn: ServerConnection):
+    """
+    The main session loop
+    Handshake will be performed
+    Messages will be published until some action is requested from the client
+    When a publish window is interrupted, the action will be handled and acked
+    args:
+        conn: ServerConnection - the websocket connection object
+    """
+    logger.info("accepted connection")
+
+    try:
+        success, session = await perform_handshake(conn)
+        if not success:
+            logger.info("Unable to agree on session with client")
+            return
+
+        assert session is not None, "Null session returned from successful handshake"
+        logger.info(f"aquired handshake: {session.symbol}")
+        bars = session.client.reqRealTimeBars(
+            contract=session.contract, barSize=5, whatToShow="TRADES", useRTH=False
+        )
+        queue = asyncio.Queue()
+        handler = curry_bar_handler(queue)
+        bars.updateEvent += handler
+        while True:
+            ts = time()
+            try:
+                ticker = await queue.get_nowait();
+                ticker_payload = TickerMessage.from_ticker(ticker)
+            except asyncio.queues.QueueEmpty:
+                ticker_payload = None
+
+            message = TickerPayload(ticker=ticker_payload).model_dump_json().encode("utf-8")
+            await conn.send(message)
+            try:
+                msg = await asyncio.wait_for(conn.recv(), timeout=(session.publishCadence - (time() - ts)))
+                await service_client_action_request(session, msg, conn, state_db)
+            except asyncio.TimeoutError:
+                pass
     except ConnectionClosedOK:
         logger.info("client closed connection")
     except ConnectionClosedError:

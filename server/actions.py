@@ -1,19 +1,30 @@
 from ib_async import (
     IB,
-    Ticker,
     Contract,
     LimitOrder,
     RealTimeBarList,
     LimitOrder,
     Trade,
 )
-from pydantic import ValidationError
-from data_types import OrderType, TickerMessage, OrderAck, Number
+from data_types import (
+    ServerStateAssertionAck,
+    ServerState,
+    OrderType,
+    TickerMessage,
+    OrderAck,
+    Number,
+    MessageParameter,
+    coerce_message_to_type,
+    TradingSession,
+    UpdateSubscription
+)
+from db import Database
 from time import time
 import asyncio
 from websockets import ServerConnection, Data
 from typing import Union
 import logging
+from pydantic import ValidationError
 
 logger = logging.getLogger("log")
 
@@ -60,8 +71,6 @@ async def publish_messages(
     args:
         sub_params: Subscribe - subscription parameters
         conn: ServerConnection - the websocket connection object
-        TODO:
-            ibkr_client: The IBKR client to request and publish messages
     returns:
         None
     """
@@ -84,8 +93,8 @@ async def place_order(
     order_type: OrderType,
     order_value: Union[float, int],
 ) -> OrderAck:
+    # TODO: figure out lmtPrice argument
     order = create_order(action=order_type, totalQuantity=order_value, lmtPrice=100.0)
-    # TODO: determine the error handling logic here
     trade = ib_client.placeOrder(contract, order)
 
     await wait_for_trade(trade)
@@ -109,8 +118,6 @@ async def pub_sub(
     args:
         conn: ServerConnection - the object holding the connection state
         sub_params: Subscribe - the parameters for the subscription
-        TODO:
-            the ibkr client will be passed here to actually grab the messages
     returns:
         Tuple[bool, Optional[str]]
             bool - and indicator of whether or not the subscription was interupted
@@ -131,3 +138,62 @@ async def pub_sub(
     publish_task.cancel()
     new_message = interupt_task.result()
     return new_message
+
+
+async def service_client_action_request(
+    session: TradingSession, msg: Data, conn: ServerConnection, state_db: Database
+):
+    try:
+        t, msg_data = coerce_message_to_type(msg_str=msg)
+    except ValidationError:
+        logger.info(f"message was invalid: {msg}")
+        await conn.send('"error": "Invalid Message"'.encode("utf-8"))
+        return
+    except AssertionError:
+        logger.info("msg is None when trying to read message type and data")
+        return
+
+    match t:
+        case MessageParameter.SubmitBuyOrder:
+            stake_in = msg_data.buyOrder  # pyright: ignore
+            assert isinstance(stake_in, Union[float, int])
+            ack = await place_order(
+                ib_client=session.client,
+                contract=session.contract,
+                order_type=OrderType.Buy,
+                order_value=stake_in,
+            )
+
+            # update state only with the amount of the order that was filled
+            await state_db.buy(session.symbol, ack.filled)
+            await conn.send(ack.model_dump_json().encode("utf-8"))
+        case MessageParameter.SubmitSellOrder:
+            stake_out = msg_data.sellOrder  # pyright: ignore
+            assert isinstance(stake_out, Union[float, int])
+            ack = await place_order(
+                ib_client=session.client,
+                contract=session.contract,
+                order_type=OrderType.Sell,
+                order_value=stake_out,
+            )
+
+            # update state only with the amount of the order that was filled
+            await state_db.sell(session.symbol, ack.filled)
+            await conn.send(ack.model_dump_json().encode("utf-8"))
+        case MessageParameter.UpdateSubscription:
+            # this will seldom be used in the beginning
+            assert isinstance(
+                msg_data, UpdateSubscription
+            ), "Subscribe message is wrong type"
+            session.update_sub_parameter(update=msg_data)
+        case MessageParameter.CloseConnection:
+            await conn.close()
+            return
+        case MessageParameter.ServerState:
+            assert isinstance(msg_data, ServerState)
+            session = await state_db.get(msg_data.symbol) #pyright: ignore
+            assert session is not None
+            rx_msg = ServerStateAssertionAck(
+                symbol=msg_data.symbol, stake=session.currentPosition
+            ).model_dump_json()
+            await conn.send(rx_msg)
