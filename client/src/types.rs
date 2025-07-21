@@ -1,14 +1,21 @@
+use crate::ack_types;
 use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Display, Formatter, Result as FmtResult};
+use std::marker::PhantomData;
 use std::ops::Index;
-use tokio_tungstenite::WebSocketStream;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tungstenite::Message;
 /*
 * 5 possible states:
+* PreConnection
+* PreHandshake
+* IntraSession
 * HandShake
 * Subscribing
 * Buying
@@ -37,6 +44,11 @@ use tungstenite::Message;
 * message enum
 * */
 
+type WebSocketWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type WebSocketReader = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+
+type ThreadSafeError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 #[derive(Debug, Deserialize)]
 pub enum HandshakeStatus {
     Success,
@@ -47,6 +59,12 @@ pub enum HandshakeStatus {
 #[allow(dead_code)]
 pub struct HandshakeAck {
     status: HandshakeStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RecievedTicker {
+    ticker: Option<BaseTicker>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,12 +125,11 @@ where
     }
 }
 
-type ServerMessageResult = Result<String, StateError>;
-
 #[derive(Debug)]
 enum StateErrorVariant {
     HandShake,
     InvalidMessage,
+    UnsuccessfulHandshake,
     ConnectionClosed,
     #[allow(dead_code)]
     PositionActive,
@@ -148,6 +165,7 @@ impl Display for StateError {
             }
             StateErrorVariant::InvalidMessage => "Unable to generate message",
             StateErrorVariant::HandShake => "Hand shake already completed",
+            StateErrorVariant::UnsuccessfulHandshake => "Hand shake recovery failed",
         };
         write!(f, "{}", err_message)
     }
@@ -161,238 +179,370 @@ struct SubParameters {
     window: u16,
 }
 
-pub struct ServerSubscription {
+trait PositionState {}
+
+struct PreConnection;
+
+impl PositionState for PreConnection {}
+
+struct PreHandshake;
+
+impl PositionState for PreHandshake {}
+
+struct IntraSession;
+
+impl PositionState for IntraSession {}
+
+struct PostSession;
+
+impl PositionState for PostSession {}
+
+pub struct MessageBrokerClient<S>
+where
+    S: PositionState,
+{
     symbol: String,
-    current_stake: f32,
-    previous_stake: f32,
-    sub_parameters: SubParameters,
-    state: ClientState,
+    pub_cadence: usize,
+    state: PhantomData<S>,
+    writr: WebSocketWriter,
+    readr: WebSocketReader,
 }
 
-impl ServerSubscription {
-    pub fn new(symbol: String) -> ServerSubscription {
-        ServerSubscription {
+impl MessageBrokerClient<PreConnection> {
+    pub async fn new(
+        symbol: String,
+        url: String,
+        port: usize,
+        endpoint: Option<String>,
+    ) -> Result<MessageBrokerClient<PreHandshake>, ThreadSafeError> {
+        let mut connection_string = format!("{url}:{port}");
+        if let Some(e) = endpoint {
+            connection_string.push('/');
+            connection_string.push_str(&e);
+        }
+        let (stream, _) = connect_async(&connection_string).await?;
+
+        let (writr, readr) = stream.split();
+        Ok(MessageBrokerClient::<PreHandshake> {
             symbol,
-            current_stake: 0_f32,
-            previous_stake: 0_f32,
-            sub_parameters: SubParameters::default(),
-            state: ClientState::HandShake,
+            pub_cadence: 5_usize,
+            writr,
+            readr,
+            state: PhantomData::<PreHandshake>,
+        })
+    }
+}
+
+enum HandshakeError {
+    ConnectionError,
+    BadHandshake,
+}
+
+impl MessageBrokerClient<PreHandshake> {
+    pub async fn handshake(
+        mut self,
+        pt: PositionType,
+    ) -> Result<MessageBrokerClient<IntraSession>, Self> {
+        // on success move -> IntraSession state
+        // on failure, hand back self
+        let sm = ServerMessage::SessionHandshake {
+            symbol: self.symbol.clone(),
+            publish_cadence: 5_u16,
+            position_type: pt,
+        };
+        let Ok(_) = self.send_handshake(sm).await else {
+            return Err(self);
+        };
+        let Ok(_) = self.read_handshake_ack().await else {
+            return Err(self);
+        };
+        let Self {
+            symbol,
+            pub_cadence,
+            readr,
+            writr,
+            ..
+        } = self;
+        Ok(MessageBrokerClient::<IntraSession> {
+            symbol,
+            pub_cadence,
+            readr,
+            writr,
+            state: PhantomData::<IntraSession>,
+        })
+    }
+
+    async fn send_handshake(&mut self, handshake: ServerMessage) -> Result<(), HandshakeError> {
+        let Ok(msg) = serde_json::to_string::<ServerMessage>(&handshake) else {
+            return Err(HandshakeError::BadHandshake);
+        };
+        match self.writr.send(Message::Binary(Bytes::from(msg))).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(HandshakeError::ConnectionError),
         }
     }
 
-    pub fn update_parameters(&mut self, cadence: u16, window: u16) -> ServerMessageResult {
-        self.sub_parameters = SubParameters { cadence, window };
-        self.state = ClientState::Subscribed;
-        self.generate_server_message()
-    }
-
-    pub async fn handshake<T>(
-        &self,
-        writr: &mut SplitSink<WebSocketStream<T>, Message>,
-        recvr: &mut SplitStream<WebSocketStream<T>>,
-    ) -> Result<(), Box<dyn Error>>
-    where
-        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        // generate the handshake message
-        // if there is an error on the message broker, try again
-        let base_m = ServerMessage::HandShake {
-            symbol: &self.symbol,
-        };
-
-        let msg = serde_json::to_string::<ServerMessage>(&base_m)?;
-
-        writr.send(Message::Binary(Bytes::from(msg))).await?;
-
-        while let Some(ack) = recvr.next().await {
+    async fn read_handshake_ack(&mut self) -> Result<(), HandshakeError> {
+        while let Some(ack) = self.readr.next().await {
             match ack {
                 Ok(s_ack) => match s_ack {
                     Message::Binary(m) => {
-                        let ack_m = serde_json::from_slice::<HandshakeAck>(&m)?;
-                        if matches!(ack_m.status, HandshakeStatus::Success) {
-                            return Ok(());
-                        } else {
-                            return Err("Handshake not successful".into());
-                        }
+                        if let Ok(ack_m) = serde_json::from_slice::<HandshakeAck>(&m) {
+                            if matches!(ack_m.status, HandshakeStatus::Success) {
+                                return Ok(());
+                            }
+                        };
+                        return Err(HandshakeError::BadHandshake);
                     }
                     Message::Text(m) => {
-                        let ack_m = serde_json::from_str::<HandshakeAck>(&m)?;
-                        if matches!(ack_m.status, HandshakeStatus::Success) {
-                            return Ok(());
-                        } else {
-                            return Err("Handshake not successful".into());
-                        }
+                        if let Ok(ack_m) = serde_json::from_str::<HandshakeAck>(&m) {
+                            if matches!(ack_m.status, HandshakeStatus::Success) {
+                                return Ok(());
+                            }
+                        };
+                        return Err(HandshakeError::BadHandshake);
                     }
                     Message::Ping(m) => {
                         // pong back with
-                        writr.send(Message::Pong(m)).await?;
+                        let _ = self.writr.send(Message::Pong(m)).await;
                     }
                     Message::Pong(_) => {
                         // can safely accept a pong and let this be an acknowledgement of a live
                         // connection
                         continue;
                     }
-                    Message::Close(m) => {
-                        writr.send(Message::Close(m)).await?;
-                        return Err("Connection closed before handshake recieved".into());
-                    }
-                    _ => return Err("recieved incomplete message".into()),
+                    Message::Close(_) => return Err(HandshakeError::ConnectionError),
+
+                    _ => return Err(HandshakeError::ConnectionError),
                 },
-                Err(e) => return Err(format!("Handshake not successful: {:?}", e).into()),
+                Err(_) => return Err(HandshakeError::ConnectionError),
+            }
+        }
+        Err(HandshakeError::ConnectionError)
+    }
+}
+
+#[derive(Debug)]
+enum SessionError {
+    InvalidMessage,
+    ConnectionClosed,
+    NoAvailableTicker,
+    ConnectionReset,
+}
+
+impl Display for SessionError {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        let msg = match self {
+            Self::InvalidMessage => "Message sent to Message Broker invalid",
+            Self::ConnectionClosed => "Session Connection is Closed",
+            Self::ConnectionReset => "Connection was reset",
+            Self::NoAvailableTicker => "No ticker available",
+        };
+
+        write!(f, "{msg}")
+    }
+}
+
+impl std::error::Error for SessionError {}
+unsafe impl Send for SessionError {}
+unsafe impl Sync for SessionError {}
+
+impl MessageBrokerClient<IntraSession> {
+    pub async fn update_parameters(&mut self, cadence: usize) -> Result<(), ThreadSafeError> {
+        // send a message to update the parameters
+        // need to handle the case where a ticker in the queue, if so handle it
+        // wait for an ack
+        self.pub_cadence = cadence;
+        todo!()
+    }
+
+    pub async fn submit_sell_order(
+        &mut self,
+        order_size: f32,
+    ) -> Result<ack_types::OrderAck, SessionError> {
+        // try to submit order
+        // if order fails with a connection close error, perform recovery handshake
+        match self
+            .submit_order(order_size, ack_types::OrderType::Sell)
+            .await
+        {
+            Ok(ack) => Ok(ack),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn submit_order(
+        &mut self,
+        order_size: f32,
+        order_type: ack_types::OrderType,
+    ) -> Result<ack_types::OrderAck, SessionError> {
+        let order = match order_type {
+            ack_types::OrderType::Buy => ServerMessage::SubmitBuyOrder {
+                buy_order: order_size,
+            },
+            ack_types::OrderType::Sell => ServerMessage::SubmitSellOrder {
+                sell_order: order_size,
+            },
+        };
+        match self.upsert_message(order).await {
+            Ok(_) => {}
+            Err(_e) => {
+                todo!()
+            }
+        }
+        // read incoming message
+        match self.read_message::<ack_types::OrderAck>().await {
+            Ok(ack) => Ok(ack),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn submit_buy_order(
+        &mut self,
+        order_size: f32,
+    ) -> Result<ack_types::OrderAck, SessionError> {
+        // submit the order
+        // if the connection is terminated, recover
+        // wait for the ack from the broker
+        // give the ack back to the user
+        match self
+            .submit_order(order_size, ack_types::OrderType::Buy)
+            .await
+        {
+            Ok(ack) => Ok(ack),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn upsert_message<'a>(&mut self, message: ServerMessage) -> Result<(), ThreadSafeError> {
+        let msg = serde_json::to_string::<ServerMessage>(&message)?;
+        self.writr.send(Message::Binary(Bytes::from(msg))).await?;
+        Ok(())
+    }
+
+    pub async fn retrieve_ticker(&mut self) -> Result<Option<BaseTicker>, StateError> {
+        match self.read_message::<RecievedTicker>().await {
+            Ok(t) => Ok(t.ticker),
+            Err(e) => {
+                if matches!(e, SessionError::ConnectionClosed) {
+                    match self.recovery_handshake().await {
+                        Ok(_) => return Ok(None),
+                        Err(e) => return Err(e),
+                    }
+                };
+                return Err(StateError {
+                    error: StateErrorVariant::InvalidMessage,
+                });
+            }
+        }
+    }
+
+    async fn read_message<T>(&mut self) -> Result<T, SessionError>
+    where
+        T: DeserializeOwned,
+    {
+        /*
+        Idea here is to read a message
+        If the message is Ping/Pong respond and wait for the next message
+        If we get text or a binary message back we can return it the message enum
+        If the connection is closed, return a connection close error
+        if we get a frame, the message is invalid, we should probably not get here
+        */
+        while let Some(msg_res) = self.readr.next().await {
+            match msg_res {
+                Ok(message) => match message {
+                    Message::Binary(data) => {
+                        let Ok(data) = serde_json::from_slice::<T>(&data) else {
+                            return Err(SessionError::NoAvailableTicker);
+                        };
+                        return Ok(data);
+                    }
+                    Message::Text(data) => {
+                        let Ok(data) = serde_json::from_str::<T>(&data) else {
+                            return Err(SessionError::NoAvailableTicker);
+                        };
+                        return Ok(data);
+                    }
+                    Message::Ping(m) => {
+                        // pong back
+                        let _ = self.writr.send(Message::Pong(m)).await;
+                        continue;
+                    }
+                    Message::Pong(_) => {
+                        // ack to a Ping, safely ignore
+                        continue;
+                    }
+                    Message::Close(_) => return Err(SessionError::ConnectionClosed),
+                    Message::Frame(_) => return Err(SessionError::InvalidMessage),
+                },
+                Err(_) => {}
             }
         }
         todo!()
     }
 
-    #[allow(dead_code)]
-    pub fn reinstate_handshake(&mut self) -> ServerMessageResult {
-        let prev_state = self.state;
-        self.state = ClientState::HandShake;
-        let message = self.generate_server_message()?;
-        self.state = prev_state;
-        Ok(message)
+    pub async fn close_connection(self) -> MessageBrokerClient<PostSession> {
+        // send close message
+        let Self {
+            symbol,
+            readr,
+            writr,
+            pub_cadence,
+            ..
+        } = self;
+
+        return MessageBrokerClient {
+            symbol,
+            readr,
+            writr,
+            pub_cadence,
+            state: PhantomData::<PostSession>,
+        };
     }
 
-    pub async fn assert_server_state<T>(
-        &self,
-        writr: &mut SplitSink<WebSocketStream<T>, Message>,
-        recvr: &mut SplitStream<WebSocketStream<T>>,
-    ) -> Result<(), Box<dyn Error>>
-    where
-        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        let message = serde_json::to_string::<ServerMessage>(&ServerMessage::ServerState {
-            symbol: &self.symbol,
-        })?;
+    #[allow(dead_code)]
+    async fn recovery_handshake(&mut self) -> Result<(), StateError> {
+        // start a new connection
+        // send a recovery handshake
+        // wait for the ack
+        let server_message = ServerMessage::RecoveryHandshake {
+            symbol: self.symbol.clone(),
+        };
 
-        writr
-            .send(tungstenite::Message::Binary(bytes::Bytes::from(message)))
-            .await?;
-
-        let mut recv_message_opt: Option<ServerStateAssertion> = None;
-
-        while recv_message_opt.is_none() {
-            let Some(message) = recvr.next().await else {
-                return Err("No message".into());
-            };
-
-            match message {
-                Ok(m) => match m {
-                    Message::Text(t) => {
-                        let message = serde_json::from_str::<ServerStateAssertion>(&t)?;
-                        recv_message_opt = Some(message);
-                    }
-                    Message::Binary(b) => {
-                        let message = serde_json::from_slice::<ServerStateAssertion>(&b)?;
-                        recv_message_opt = Some(message);
-                    }
-                    Message::Close(_) => return Err("Connection Closed".into()),
-                    _ => continue,
-                },
-                Err(_) => {
-                    todo!()
-                }
-            };
+        self.upsert_message(server_message);
+        match self.read_message::<HandshakeAck>().await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(StateError {
+                error: StateErrorVariant::InvalidMessage,
+            }),
         }
-        let server_state = recv_message_opt.unwrap();
-        println!("current server state: {:?}", server_state);
-        println!("current client state: {}", self.current_stake);
-        assert!(server_state.stake - self.current_stake < f32::EPSILON);
-        Ok(())
     }
 
-    pub fn submit_buy(&mut self, order_amount: f32) -> ServerMessageResult {
-        let new_position_value = self.current_stake + order_amount;
-        self.previous_stake = self.current_stake;
-        self.current_stake = new_position_value;
-        self.state = ClientState::Buying;
-        self.generate_server_message()
+    async fn perform_broker_state_assertion(
+        &mut self,
+    ) -> Result<ack_types::ServerStateAck, SessionError> {
+        todo!()
     }
+}
 
-    pub fn submit_sell(&mut self, order_amount: f32) -> ServerMessageResult {
-        let new_position_value = self.current_stake - order_amount;
-        debug_assert!(new_position_value > 0_f32);
-
-        self.previous_stake = self.current_stake;
-        self.current_stake = new_position_value;
-        self.state = ClientState::Selling;
-        self.generate_server_message()
-    }
-
-    pub fn close_connection(&mut self) -> ServerMessageResult {
-        self.state = ClientState::Closing;
-        let message = self.generate_server_message()?;
-        self.state = ClientState::Closed;
-        Ok(message)
-    }
-
-    fn generate_server_message(&self) -> ServerMessageResult {
-        let message: Result<String, serde_json::Error> = match self.state {
-            ClientState::HandShake => {
-                let handshake_message = ServerMessage::HandShake {
-                    symbol: &self.symbol,
-                };
-                serde_json::to_string::<ServerMessage>(&handshake_message)
-            }
-            ClientState::Buying => {
-                let buy_order = self.current_stake - self.previous_stake;
-                let buy_message = ServerMessage::SubmitBuyOrder { buy_order };
-
-                serde_json::to_string::<ServerMessage>(&buy_message)
-            }
-            ClientState::Selling => {
-                let sell_order = self.previous_stake - self.current_stake;
-                let sell_message = ServerMessage::SubmitSellOrder { sell_order };
-
-                serde_json::to_string::<ServerMessage>(&sell_message)
-            }
-            ClientState::Subscribed => {
-                let message = ServerMessage::Subscribe {
-                    publish_cadence: self.sub_parameters.cadence,
-                    window: self.sub_parameters.window,
-                };
-
-                serde_json::to_string::<ServerMessage>(&message)
-            }
-            ClientState::Closing => {
-                let status = String::from("OK");
-                let message = ServerMessage::CloseConnection { status: &status };
-                serde_json::to_string::<ServerMessage>(&message)
-            }
-            ClientState::Closed => {
-                return Err(StateError::new(StateErrorVariant::ConnectionClosed));
-            }
-        };
-        let Ok(payload) = message else {
-            return Err(StateError::new(StateErrorVariant::InvalidMessage));
-        };
-        Ok(payload)
-    }
-
-    #[allow(dead_code)]
-    pub fn current_state(&self) -> &ClientState {
-        &self.state
-    }
-
-    pub fn current_position(&self) -> f32 {
-        self.current_stake
-    }
+#[derive(Debug, Serialize, Deserialize)]
+pub enum PositionType {
+    Long,
+    Short,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 #[serde(rename = "camelCase")]
 pub enum ClientState {
-    HandShake,
-    Buying,
-    Selling,
+    PreConnection,
+    Transaction,
     Subscribed,
-    Closing,
     Closed,
 }
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub enum ServerMessage<'de> {
+pub enum ServerMessage {
     #[serde(rename_all = "camelCase")]
     SubmitBuyOrder {
         buy_order: f32,
@@ -408,15 +558,26 @@ pub enum ServerMessage<'de> {
         window: u16,
     },
     ServerState {
-        symbol: &'de str,
+        symbol: String,
     },
-    HandShake {
-        symbol: &'de str,
+    SessionHandshake {
+        symbol: String,
+        publish_cadence: u16,
+        position_type: PositionType,
+    },
+    RecoveryHandshake {
+        symbol: String,
     },
     CloseConnection {
-        status: &'de str,
+        status: String,
     },
 }
+
+/*
+*{"Handshake": {
+    "symbol": ...
+}
+* */
 
 #[derive(Deserialize, Debug)]
 pub struct PubMessage {

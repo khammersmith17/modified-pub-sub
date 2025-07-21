@@ -16,7 +16,7 @@ from data_types import (
     MessageParameter,
     coerce_message_to_type,
     TradingSession,
-    UpdateSubscription
+    UpdateSubscription,
 )
 from db import Database
 from time import time
@@ -56,8 +56,13 @@ async def wait_for_trade(trade: Trade):
 
 
 def curry_bar_handler(queue: asyncio.Queue):
-    async def bar_handler(_, new_bar):
-        await queue.put(new_bar)
+    """
+    define an event handler to update the queue of tickers
+    the event handlers only take synchronous functions
+    """
+
+    def bar_handler(_, new_bar):
+        asyncio.create_task(queue.put(new_bar))
 
     return bar_handler
 
@@ -143,6 +148,14 @@ async def pub_sub(
 async def service_client_action_request(
     session: TradingSession, msg: Data, conn: ServerConnection, state_db: Database
 ):
+    """
+    Performs some client request action on IBKR and ack back to the client
+    args:
+        session: TradingSession - the object holding session attributes
+        msg: Data - the message recieved from the client
+        conn: ServerConnection - the object holding the websocket connnnection
+        state_db Database - the in memory database
+    """
     try:
         t, msg_data = coerce_message_to_type(msg_str=msg)
     except ValidationError:
@@ -191,7 +204,7 @@ async def service_client_action_request(
             return
         case MessageParameter.ServerState:
             assert isinstance(msg_data, ServerState)
-            session = await state_db.get(msg_data.symbol) #pyright: ignore
+            session = await state_db.get(msg_data.symbol)  # pyright: ignore
             assert session is not None
             rx_msg = ServerStateAssertionAck(
                 symbol=msg_data.symbol, stake=session.currentPosition

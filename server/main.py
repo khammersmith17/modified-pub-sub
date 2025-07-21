@@ -21,7 +21,12 @@ from data_types import (
     OrderType,
 )
 from time import time
-from actions import pub_sub, place_order, curry_bar_handler, service_client_action_request
+from actions import (
+    pub_sub,
+    place_order,
+    curry_bar_handler,
+    service_client_action_request,
+)
 from ib_async import IB, Stock
 from typing import Optional, Union, Tuple
 import asyncio
@@ -29,14 +34,12 @@ import logging
 from db import Database
 
 state_db = Database()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("logger")
 
 IBKR_IP_ADDRESS = ""
-IBKR_PORT = 0
-
-
-# TODO: then write a simulated counterpart to test on
+IBKR_PORT = 4001
 
 
 async def perform_handshake(
@@ -135,99 +138,8 @@ async def connection_handler(conn: ServerConnection):
 
         assert session is not None, "Null session returned from successful handshake"
         logger.info(f"aquired handshake: {session.symbol}")
-
-        while True:
-            bars = session.client.reqRealTimeBars(
-                contract=session.contract, barSize=5, whatToShow="TRADES", useRTH=False
-            )
-            msg = await pub_sub(
-                conn=conn,
-                cadence=session.publishCadence,
-                ibkr_ticker=bars,
-            )
-
-            try:
-                t, msg_data = coerce_message_to_type(msg_str=msg)
-            except ValidationError:
-                logger.info(f"message was invalid: {msg}")
-                await conn.send('"error": "Invalid Message"'.encode("utf-8"))
-                continue
-            except AssertionError:
-                logger.info("msg is None when trying to read message type and data")
-                continue
-
-            logger.info(f"t:\n{t}\nmsg_data:{msg_data}")
-            match t:
-                case MessageParameter.SubmitBuyOrder:
-                    stake_in = msg_data.buyOrder  # pyright: ignore
-                    assert isinstance(stake_in, Union[float, int])
-                    ack = await place_order(
-                        ib_client=session.client,
-                        contract=session.contract,
-                        order_type=OrderType.Buy,
-                        order_value=stake_in,
-                    )
-
-                    # update state only with the amount of the order that was filled
-                    await state_db.buy(session.symbol, ack.filled)
-                    await conn.send(ack.model_dump_json().encode("utf-8"))
-                case MessageParameter.SubmitSellOrder:
-                    stake_out = msg_data.sellOrder  # pyright: ignore
-                    assert isinstance(stake_out, Union[float, int])
-                    ack = await place_order(
-                        ib_client=session.client,
-                        contract=session.contract,
-                        order_type=OrderType.Sell,
-                        order_value=stake_out,
-                    )
-
-                    # update state only with the amount of the order that was filled
-                    await state_db.sell(session.symbol, ack.filled)
-                    await conn.send(ack.model_dump_json().encode("utf-8"))
-                case MessageParameter.UpdateSubscription:
-                    # this will seldom be used in the beginning
-                    assert isinstance(
-                        msg_data, UpdateSubscription
-                    ), "Subscribe message is wrong type"
-                    session.update_sub_parameter(update=msg_data)
-                case MessageParameter.CloseConnection:
-                    await conn.close()
-                    return
-                case MessageParameter.ServerState:
-                    assert isinstance(msg_data, ServerState)
-                    session = await state_db.get(msg_data.symbol)
-                    assert session is not None
-                    rx_msg = ServerStateAssertionAck(
-                        symbol=msg_data.symbol, stake=session.currentPosition
-                    ).model_dump_json()
-                    await conn.send(rx_msg)
-    except ConnectionClosedOK:
-        logger.info("client closed connection")
-    except ConnectionClosedError:
-        logger.info("closed connection")
-    logger.info("exiting connection")
-
-async def connection_handler_v2(conn: ServerConnection):
-    """
-    The main session loop
-    Handshake will be performed
-    Messages will be published until some action is requested from the client
-    When a publish window is interrupted, the action will be handled and acked
-    args:
-        conn: ServerConnection - the websocket connection object
-    """
-    logger.info("accepted connection")
-
-    try:
-        success, session = await perform_handshake(conn)
-        if not success:
-            logger.info("Unable to agree on session with client")
-            return
-
-        assert session is not None, "Null session returned from successful handshake"
-        logger.info(f"aquired handshake: {session.symbol}")
         bars = session.client.reqRealTimeBars(
-            contract=session.contract, barSize=5, whatToShow="TRADES", useRTH=False
+            contract=session.contract, barSize=5, whatToShow="TRADES", useRTH=True
         )
         queue = asyncio.Queue()
         handler = curry_bar_handler(queue)
@@ -235,15 +147,20 @@ async def connection_handler_v2(conn: ServerConnection):
         while True:
             ts = time()
             try:
-                ticker = await queue.get_nowait();
+                # get_nowiat() is synchronous
+                ticker = queue.get_nowait()
                 ticker_payload = TickerMessage.from_ticker(ticker)
             except asyncio.queues.QueueEmpty:
                 ticker_payload = None
 
-            message = TickerPayload(ticker=ticker_payload).model_dump_json().encode("utf-8")
+            message = (
+                TickerPayload(ticker=ticker_payload).model_dump_json().encode("utf-8")
+            )
             await conn.send(message)
             try:
-                msg = await asyncio.wait_for(conn.recv(), timeout=(session.publishCadence - (time() - ts)))
+                msg = await asyncio.wait_for(
+                    conn.recv(), timeout=(session.publishCadence - (time() - ts))
+                )
                 await service_client_action_request(session, msg, conn, state_db)
             except asyncio.TimeoutError:
                 pass

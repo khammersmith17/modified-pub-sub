@@ -7,7 +7,7 @@ use tungstenite::Message;
 mod types;
 use rand::random_range;
 use std::time::Instant;
-use types::{PubMessage, ServerSubscription};
+mod ack_types;
 pub mod money;
 
 #[tokio::main]

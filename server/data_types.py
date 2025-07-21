@@ -5,7 +5,7 @@ from typing import TypeAlias, Union, Tuple, Self, Optional
 from websockets import Data
 from math import floor, ceil
 from random import uniform as random_uniform
-from ib_async import  Stock, IB, RealTimeBar
+from ib_async import Stock, IB, RealTimeBar
 import math
 from datetime import datetime, timedelta
 
@@ -119,8 +119,14 @@ class TickerMessage(BaseModel):
     @classmethod
     def from_ticker(cls, ticker: Union[RealTimeBar, SimulatedBar]):
         return cls(
-            h=ticker.high, l=ticker.low, c=ticker.close, o=ticker.open_, v=ticker.volume, timestamp=int(math.floor(ticker.time.timestamp()))
+            h=ticker.high,
+            l=ticker.low,
+            c=ticker.close,
+            o=ticker.open_,
+            v=ticker.volume,
+            timestamp=int(math.floor(ticker.time.timestamp())),
         )
+
 
 class TickerPayload(BaseModel):
     ticker: Optional[TickerMessage]
