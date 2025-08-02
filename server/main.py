@@ -10,20 +10,14 @@ from data_types import (
     TickerMessage,
     TradingSession,
     MessageParameter,
-    UpdateSubscription,
     coerce_message_to_type,
     HandshakeAck,
-    ServerStateAssertionAck,
-    ServerState,
     HandshakeStatus,
     SessionHandshake,
     RecoveryHandshake,
-    OrderType,
 )
 from time import time
 from actions import (
-    pub_sub,
-    place_order,
     curry_bar_handler,
     service_client_action_request,
 )
@@ -46,10 +40,10 @@ async def perform_handshake(
     conn: ServerConnection,
 ) -> Tuple[bool, Optional[TradingSession]]:
     """
-    Perform the handshake with the client
-    If the session is new, then create ib client, contract with the symbol, and write an entry into the state database
-    If the session is a renewal of a session where the connection was dropped, then retrieve the session information
-    Session state will be returned to the main loop
+    Perform the handshake with the client,
+    If the session is new, then create ib client, contract with the symbol, and write an entry into the state database,
+    If the session is a renewal of a session where the connection was dropped, then retrieve the session information.
+    Session state will be returned to the main handler.
     args:
         conn: ServerConnection - the websocket connection object
     returns:
@@ -121,10 +115,9 @@ async def perform_handshake(
 
 async def connection_handler(conn: ServerConnection):
     """
-    The main session loop
-    Handshake will be performed
-    Messages will be published until some action is requested from the client
-    When a publish window is interrupted, the action will be handled and acked
+    The main session loop where handshake will be performed,
+    messages will be published until some action is requested from the client.
+    When a publish window is interrupted, the action will be handled and acked.
     args:
         conn: ServerConnection - the websocket connection object
     """
@@ -138,8 +131,9 @@ async def connection_handler(conn: ServerConnection):
 
         assert session is not None, "Null session returned from successful handshake"
         logger.info(f"aquired handshake: {session.symbol}")
+        # TODO: figure out what useRTH means
         bars = session.client.reqRealTimeBars(
-            contract=session.contract, barSize=5, whatToShow="TRADES", useRTH=True
+            contract=session.contract, barSize=5, whatToShow="TRADES", useRTH=False
         )
         queue = asyncio.Queue()
         handler = curry_bar_handler(queue)
@@ -147,7 +141,7 @@ async def connection_handler(conn: ServerConnection):
         while True:
             ts = time()
             try:
-                # get_nowiat() is synchronous
+                # get_nowait() is synchronous
                 ticker = queue.get_nowait()
                 ticker_payload = TickerMessage.from_ticker(ticker)
             except asyncio.queues.QueueEmpty:

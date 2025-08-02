@@ -34,12 +34,18 @@ ORDER_STATUS_POLL_CADENCE: float = 0.001  # Poll every millisecond
 def create_order(
     action: OrderType, totalQuantity: float, lmtPrice: float
 ) -> LimitOrder:
+    """
+    Utility to create a LimitOrder.
+    """
     return LimitOrder(
         action=action.value, totalQuantity=totalQuantity, lmtPrice=lmtPrice, tif="IOC"
     )
 
 
 async def wait_for_trade(trade: Trade):
+    """
+    Utility to wait for the completion of a trade.
+    """
     done = asyncio.Event()
 
     def is_done(_):
@@ -57,12 +63,15 @@ async def wait_for_trade(trade: Trade):
 
 def curry_bar_handler(queue: asyncio.Queue):
     """
-    define an event handler to update the queue of tickers
-    the event handlers only take synchronous functions
+    Define an event handler to update the queue of tickers.
+    The event handlers only take synchronous functions.
+    If there is a new ticker, pop it off the RealTimeBarList
+    and push it on the queue.
     """
-
-    def bar_handler(_, new_bar):
-        asyncio.create_task(queue.put(new_bar))
+    def bar_handler(bars_list, new_bar):
+        if new_bar and len(bars_list) > 0:
+            bar = bars_list.pop()
+            asyncio.create_task(queue.put(bar))
 
     return bar_handler
 
@@ -71,8 +80,8 @@ async def publish_messages(
     cadence: Number, conn: ServerConnection, ibkr_ticker: RealTimeBarList
 ) -> None:
     """
-    Publish messages to the client indefinitely until these is an interrupt
-    Leverages a Ticker from IBKR to get the relevant messages
+    Publish messages to the client indefinitely until these is an interrupt.
+    Leverages a Ticker from IBKR to get the relevant messages.
     args:
         sub_params: Subscribe - subscription parameters
         conn: ServerConnection - the websocket connection object
@@ -118,8 +127,8 @@ async def pub_sub(
     conn: ServerConnection, cadence: Number, ibkr_ticker: RealTimeBarList
 ) -> Data:
     """
-    Orchestrates publishing messages for the duration of the sub window
-    Allows for an interupt when a new message is recieved
+    Orchestrates publishing messages for the duration of the sub window.
+    Allows for an interupt when a new message is recieved.
     args:
         conn: ServerConnection - the object holding the connection state
         sub_params: Subscribe - the parameters for the subscription
@@ -133,7 +142,7 @@ async def pub_sub(
         publish_messages(cadence=cadence, conn=conn, ibkr_ticker=ibkr_ticker)
     )
     interupt_task = asyncio.create_task(conn.recv())
-    done, _ = await asyncio.wait(
+    _, _ = await asyncio.wait(
         [publish_task, interupt_task], return_when=asyncio.FIRST_COMPLETED
     )
 
@@ -149,7 +158,8 @@ async def service_client_action_request(
     session: TradingSession, msg: Data, conn: ServerConnection, state_db: Database
 ):
     """
-    Performs some client request action on IBKR and ack back to the client
+    Performs some client request action on IBKR and ack back to the client.
+    Updates session parameters when the client requests it.
     args:
         session: TradingSession - the object holding session attributes
         msg: Data - the message recieved from the client

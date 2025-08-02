@@ -158,10 +158,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
+name = "circular_buffer"
+version = "0.1.0"
+source = "git+https://github.com/khammersmith17/circular_buffer.git#468a25f290de0dc6b702102894c641c486448357"
+
+[[package]]
 name = "client"
 version = "0.1.0"
 dependencies = [
  "bytes 1.10.1",
+ "circular_buffer",
  "futures 0.3.31",
  "rand 0.9.1",
  "serde",

@@ -1,16 +1,13 @@
-from pydantic import BaseModel, ConfigDict
-from enum import Enum
-import orjson
-from typing import TypeAlias, Union, Tuple, Self, Optional
-from websockets import Data
-from math import floor, ceil
-from random import uniform as random_uniform
-from ib_async import Stock, IB, RealTimeBar
 import math
 from datetime import datetime, timedelta
-
-
-# TODO: closing connection ack?
+from math import floor, ceil
+from random import uniform as random_uniform
+from typing import TypeAlias, Union, Tuple, Self, Optional
+from enum import Enum
+import orjson
+from pydantic import BaseModel, ConfigDict
+from websockets import Data
+from ib_async import Stock, IB, RealTimeBar
 
 
 class MessageSerializationError(Exception):

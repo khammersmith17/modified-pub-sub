@@ -1,5 +1,6 @@
 use crate::ack_types;
 use bytes::Bytes;
+use circular_buffer::CircularBuffer;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
@@ -7,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
-use std::ops::Index;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tungstenite::Message;
@@ -61,13 +61,13 @@ pub struct HandshakeAck {
     status: HandshakeStatus,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default, Clone)]
 #[allow(dead_code)]
 struct RecievedTicker {
     ticker: Option<BaseTicker>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default, Clone)]
 #[allow(dead_code)]
 struct BaseTicker {
     h: f32,
@@ -75,53 +75,60 @@ struct BaseTicker {
     c: f32,
     o: f32,
     v: f32,
+    timestamp: i64,
 }
 
-// Generic type to hold cap items in a circular buffer
-struct CircularBuffer<T> {
-    buf: Vec<T>,
-    cap: usize,
-    i: usize,
-}
-
-impl<'a, T> Index<usize> for CircularBuffer<T> {
-    type Output = T;
-    fn index(&self, idx: usize) -> &Self::Output {
-        let j = (self.i + idx) % self.cap;
-        &self.buf[j]
-    }
-}
-
+#[derive(Debug, Deserialize, Default, Clone)]
 #[allow(dead_code)]
-impl<T> CircularBuffer<T>
-where
-    T: Default + Clone,
-{
-    pub fn new(cap: usize) -> CircularBuffer<T> {
-        // allocate a Vec with cap
-        let mut buf: Vec<T> = Vec::with_capacity(cap);
+struct MinuteTicker {
+    h: f32,
+    l: f32,
+    c: f32,
+    o: f32,
+    v: f32,
+}
 
-        // allocate a default item to every position in the Vec
-        buf.resize(cap, T::default());
-
-        CircularBuffer {
-            buf,
-            cap,
-            i: 0_usize,
+fn generate_minute_avg(buffer: &CircularBuffer<BaseTicker>) -> MinuteTicker {
+    // h - absolute max over the range
+    // l absolute min over the range
+    // o first ticker o
+    // last ticker c
+    // v avg v across the mintue
+    let mut end = 1_usize;
+    let Some(&BaseTicker {
+        mut h,
+        mut l,
+        mut c,
+        o,
+        v,
+        timestamp,
+    }) = buffer.peek_tail()
+    else {
+        return MinuteTicker::default();
+    };
+    let mut accum_v = v;
+    let minute_start = timestamp - 60_i64;
+    // TODO:
+    // - iter from end until:
+    //      - timestamp is greater > 1 min ago
+    //      - or there are no tickers remaining in the buffer
+    while let Some(ticker) = buffer.peek_from_end(end) {
+        if ticker.timestamp < minute_start {
+            break;
         }
+        h = h.max(f32::max(ticker.h, ticker.o));
+        l = l.min(f32::min(ticker.l, ticker.o));
+        accum_v += ticker.v;
+        c = ticker.c;
+        end += 1;
     }
-
-    pub fn push(&mut self, item: T) {
-        // insert at i, increment
-        self.buf[self.i] = item;
-        self.i = (self.i + 1) % self.cap;
-    }
-
-    fn aggregate<R, F>(&self, f: F) -> R
-    where
-        F: Fn(&[T]) -> R,
-    {
-        f(&self.buf)
+    let avg_v = accum_v / end as f32;
+    MinuteTicker {
+        v: avg_v,
+        h,
+        l,
+        c,
+        o,
     }
 }
 
@@ -139,10 +146,24 @@ enum StateErrorVariant {
     SellVolumeToAdd,
 }
 
+unsafe impl std::marker::Send for StateErrorVariant {}
+unsafe impl std::marker::Sync for StateErrorVariant {}
+
 #[derive(Debug)]
 pub struct StateError {
     error: StateErrorVariant,
 }
+
+impl From<ThreadSafeError> for StateError {
+    fn from(_err: ThreadSafeError) -> Self {
+        Self {
+            error: StateErrorVariant::ConnectionClosed,
+        }
+    }
+}
+
+unsafe impl std::marker::Send for StateError {}
+unsafe impl std::marker::Sync for StateError {}
 
 impl StateError {
     fn new(error: StateErrorVariant) -> Self {
@@ -509,7 +530,7 @@ impl MessageBrokerClient<IntraSession> {
             symbol: self.symbol.clone(),
         };
 
-        self.upsert_message(server_message);
+        self.upsert_message(server_message).await?;
         match self.read_message::<HandshakeAck>().await {
             Ok(_) => Ok(()),
             Err(_) => Err(StateError {
@@ -573,12 +594,6 @@ pub enum ServerMessage {
     },
 }
 
-/*
-*{"Handshake": {
-    "symbol": ...
-}
-* */
-
 #[derive(Deserialize, Debug)]
 pub struct PubMessage {
     #[allow(dead_code)]
@@ -594,32 +609,23 @@ struct ServerStateAssertion {
 #[cfg(test)]
 mod test {
     use super::*;
+    use circular_buffer::CircularBuffer;
+    use serde_json::from_str;
 
     #[test]
-    fn circular_buffer() {
-        let mut buffer: CircularBuffer<i32> = CircularBuffer::new(5_usize);
-        buffer.push(1_i32);
-        buffer.push(2_i32);
-        buffer.push(3_i32);
-        buffer.push(4_i32);
-        buffer.push(5_i32);
-        buffer.push(6_i32);
+    fn test_read_in_ticker_messages() {
+        let file = std::fs::read_to_string("example_output.txt").unwrap();
 
-        assert_eq!(buffer[0], 2_i32);
-    }
+        let mut buffer = CircularBuffer::<BaseTicker>::new(12);
+        let lines = file.lines();
+        for l in lines {
+            let tick_msg: RecievedTicker = from_str(&l).unwrap();
+            if let Some(ticker) = tick_msg.ticker {
+                buffer.insert(ticker);
+            }
+        }
 
-    #[test]
-    fn circular_buffer_agg() {
-        let mut buffer: CircularBuffer<i32> = CircularBuffer::new(5_usize);
-        buffer.push(1_i32);
-        buffer.push(2_i32);
-        buffer.push(3_i32);
-        buffer.push(4_i32);
-        buffer.push(5_i32);
-        buffer.push(6_i32);
-
-        let res: i32 = buffer.aggregate(|data: &[i32]| data.iter().sum());
-
-        assert_eq!(res, 20_i32);
+        let min_ticker = generate_minute_avg(&buffer);
+        println!("minute avg: {:?}", min_ticker);
     }
 }
